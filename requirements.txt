@@ -1,0 +1,31 @@
+# Bắt buộc, luôn cần (Tầng 1-3, chế độ "cheap" của Tầng 4, Tầng 5):
+opencv-python>=4.8.0
+numpy>=1.24.0
+scikit-learn>=1.3.0   # bắt buộc cho auto_calibrate_thresholds_gmm (GMM tự tìm ngưỡng)
+
+# Cần cho chế độ "semantic" của Tầng 4 (dùng CLIP embedding trên GPU) và
+# cho OmniShotCutDetector — dùng chung 1 version để tránh xung đột:
+transformers==4.57.3
+torch>=2.0.0   # bắt buộc cho AutoShotDetector thật, GPUShotDetector, ClipEmbedder, OmniShotCutDetector
+torchvision>=0.15.0   # bắt buộc cho OmniShotCutDetector
+einops>=0.6.0  # bắt buộc cho kiến trúc AutoShot (attention block)
+ffmpeg-python>=0.2.0   # bắt buộc cho AutoShotDetector thật (đọc frame đúng cách tác giả gốc)
+decord>=0.6.0   # bắt buộc cho OmniShotCutDetector (đọc video)
+accelerate>=0.20.0   # bắt buộc cho OmniShotCutDetector
+omegaconf>=2.3.0   # bắt buộc cho OmniShotCutDetector (đọc model_args)
+
+huggingface_hub>=0.20.0   # bắt buộc cho hf_streaming.py — xử lý dataset 162GB kiểu streaming
+
+# Cho test:
+pytest>=7.0.0
+
+# Tuỳ chọn, chỉ cần khi dùng YoloDetector cho object_graph.py (mặc định
+# dùng ContourFallbackDetector, không cần cài gì thêm):
+# ultralytics>=8.0.0
+
+# Tuỳ chọn, chỉ cần khi cắm AutoShot vào Tầng 1 (xem shot_detector.AutoShotDetector):
+# (clone thêm repo https://github.com/wentaozhu/AutoShot và làm theo README của họ)
+
+# Tuỳ chọn, chỉ cần khi dùng query_aware.py với MLLM thật:
+# google-generativeai   # nếu dùng Gemini
+# openai                # nếu dùng GPT-4o
