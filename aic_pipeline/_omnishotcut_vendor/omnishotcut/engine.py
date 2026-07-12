@@ -64,18 +64,30 @@ def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=No
 
     frames = []
     frame_idx = 0
-    for frame in container.decode(video=0):
-        if frame_idx % frame_stride == 0:
-            img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
-            if width is not None and height is not None:
-                img = cv2.resize(img, (width, height))
-            frames.append(img)
-            if len(frames) >= max_frames:
-                _logger_video_read.warning(
-                    f"Đã đạt max_frames={max_frames}, dừng đọc sớm (video có thể dài hơn)."
-                )
-                break
-        frame_idx += 1
+    # Đọc theo PACKET (demux) rồi mới decode từng packet — thay vì generator
+    # decode() có thể đã buffer/giải mã ngầm nhiều frame phía trước trước khi
+    # Python kịp break, gây ra hàng loạt warning FFmpeg (đặc biệt rõ với AV1
+    # phải fallback software decode) tiếp tục xuất hiện dù đã "break". Đọc
+    # theo packet cho phép dừng NGAY sau khi đã đủ max_frames, không decode
+    # dư thêm bất kỳ packet nào phía sau.
+    stream.thread_type = "AUTO"  # cho phép FFmpeg dùng multi-thread decode nếu có, nhanh hơn
+    stopped_early = False
+    for packet in container.demux(video=0):
+        for frame in packet.decode():
+            if frame_idx % frame_stride == 0:
+                img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
+                if width is not None and height is not None:
+                    img = cv2.resize(img, (width, height))
+                frames.append(img)
+                if len(frames) >= max_frames:
+                    stopped_early = True
+                    break
+            frame_idx += 1
+        if stopped_early:
+            _logger_video_read.warning(
+                f"Đã đạt max_frames={max_frames}, dừng đọc sớm (video có thể dài hơn)."
+            )
+            break
     container.close()
 
     if not frames:
