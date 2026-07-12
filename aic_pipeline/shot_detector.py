@@ -750,12 +750,24 @@ class OmniShotCutDetector:
         mode: str = "default",
         overlap_window_length: int = 20,
         min_shot_len: int = 5,
+        max_frames: int = 6000,
     ):
+        """
+        max_frames: giới hạn RAM khi đọc video (xem docstring _read_video_pyav
+                    trong _omnishotcut_vendor/omnishotcut/engine.py). Video dài
+                    hơn max_frames sẽ TỰ ĐỘNG lấy mẫu cách đều để không tràn
+                    RAM — quan trọng với video dài (như dataset AIC, có video
+                    30.000+ frame) trên Kaggle (RAM giới hạn 13-16GB). Giảm
+                    số này nếu vẫn gặp lỗi "tried to allocate more memory";
+                    tăng lên (ví dụ 15000) nếu có nhiều RAM và muốn giữ độ
+                    chi tiết thời gian cao hơn cho video dài.
+        """
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.mode = mode
         self.overlap_window_length = overlap_window_length
         self.min_shot_len = min_shot_len
+        self.max_frames = max_frames
         self._model = None
         self._model_args = None
 
@@ -836,6 +848,7 @@ class OmniShotCutDetector:
 
         pred_ranges, pred_intra_labels, pred_inter_labels, _video_np, fps = single_video_inference(
             video_path, self._model, self._model_args, self.overlap_window_length,
+            max_frames=self.max_frames,
         )
 
         if not pred_ranges:
@@ -902,6 +915,7 @@ def make_omnishotcut_detector(
     mode: str = "default",
     overlap_window_length: int = 20,
     min_shot_len: int = 5,
+    max_frames: int = 6000,
 ) -> "OmniShotCutDetector":
     """
     Helper 1 dòng để THAY THẾ AutoShot bằng OmniShotCut làm shot detector.
@@ -929,8 +943,15 @@ def make_omnishotcut_detector(
     Nếu checkpoint_path=None (mặc định), model TỰ TẢI từ HuggingFace
     (uva-cv-lab/OmniShotCut) ngay lần detect() đầu tiên — cần Internet: On
     trên Kaggle, không cần bạn tự tải/upload checkpoint thủ công.
+
+    max_frames: QUAN TRỌNG với video dài (dataset AIC có video 30.000+
+                frame) — giới hạn số frame giữ trong RAM khi đọc video,
+                tránh lỗi Kaggle tự restart kernel vì "tried to allocate
+                more memory than is available". Giảm xuống (ví dụ 3000)
+                nếu vẫn gặp lỗi tràn RAM trên video rất dài/độ phân giải cao.
     """
     return OmniShotCutDetector(
         checkpoint_path=checkpoint_path, device=device, mode=mode,
         overlap_window_length=overlap_window_length, min_shot_len=min_shot_len,
+        max_frames=max_frames,
     )

@@ -17,25 +17,71 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # để phần còn lại của file KHÔNG cần sửa gì thêm.
 import av
 import cv2
+import logging
+
+_logger_video_read = logging.getLogger("omnishotcut.video_read")
 
 
-def _read_video_pyav(video_path, width, height):
-    """Thay thế decord.VideoReader — trả về (video_np (T,H,W,3) RGB uint8, fps)."""
+def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=None):
+    """
+    Thay thế decord.VideoReader — trả về (video_np (T,H,W,3) RGB uint8, fps).
+
+    ĐÃ VÁ LỖI TRÀN RAM: đọc TOÀN BỘ video vào 1 mảng numpy có thể tràn RAM với
+    video dài (video AIC ~32.000 frame ở 1920x1080 -> ~4.9GB chỉ riêng mảng
+    frame đã resize, cộng dồn với decode buffer/model dễ vượt RAM Kaggle,
+    khiến kernel bị Kaggle tự restart do "tried to allocate more memory than
+    is available"). Vá bằng 2 cơ chế:
+
+      1. max_frames: giới hạn cứng số frame tối đa giữ trong RAM. Nếu video
+         dài hơn, TỰ ĐỘNG lấy mẫu cách đều (uniform subsample) để giảm còn
+         đúng max_frames, thay vì đọc hết rồi mới cắt (tránh đọc thừa).
+         fps trả về được ĐIỀU CHỈNH TƯƠNG ỨNG để mọi mốc thời gian
+         (Shot.start_time/end_time) vẫn tính đúng theo thời gian THẬT của
+         video gốc, không bị lệch dù đã bỏ bớt frame.
+      2. frame_stride: nếu bạn tự biết trước cần bỏ bớt bao nhiêu (ví dụ chỉ
+         cần 1/2 số frame), truyền trực tiếp thay vì để hàm tự tính.
+
+    Mặc định max_frames=6000 -> với 224x224x3 uint8 là ~900MB RAM, an toàn
+    trên GPU notebook Kaggle tiêu chuẩn (13-16GB RAM khả dụng).
+    """
     container = av.open(video_path)
     stream = container.streams.video[0]
-    fps = float(stream.average_rate)
+    fps_original = float(stream.average_rate)
+    total_frames_estimate = stream.frames or 0
+
+    if frame_stride is None:
+        if total_frames_estimate > max_frames:
+            frame_stride = max(1, total_frames_estimate // max_frames)
+        else:
+            frame_stride = 1
+
+    if frame_stride > 1:
+        _logger_video_read.warning(
+            f"Video có ~{total_frames_estimate} frame, vượt max_frames={max_frames} "
+            f"-> lấy mẫu cách {frame_stride} frame để tránh tràn RAM. "
+            f"fps hiệu dụng: {fps_original / frame_stride:.2f} (gốc: {fps_original:.2f})."
+        )
 
     frames = []
+    frame_idx = 0
     for frame in container.decode(video=0):
-        img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
-        if width is not None and height is not None:
-            img = cv2.resize(img, (width, height))
-        frames.append(img)
+        if frame_idx % frame_stride == 0:
+            img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
+            if width is not None and height is not None:
+                img = cv2.resize(img, (width, height))
+            frames.append(img)
+            if len(frames) >= max_frames:
+                _logger_video_read.warning(
+                    f"Đã đạt max_frames={max_frames}, dừng đọc sớm (video có thể dài hơn)."
+                )
+                break
+        frame_idx += 1
     container.close()
 
     if not frames:
         raise ValueError(f"Không đọc được frame nào từ video: {video_path}")
-    return np.stack(frames, axis=0), fps
+    fps_effective = fps_original / frame_stride
+    return np.stack(frames, axis=0), fps_effective
 
 
 # Import files from the local folder
@@ -173,7 +219,7 @@ def merge_predictions(pred_boundary_full, pred_boundary, duplicate_tolerance=2):
 
 
 
-def single_video_inference(video_path, model, model_args, overlap_window_length):
+def single_video_inference(video_path, model, model_args, overlap_window_length, max_frames=6000):
 
 
     # Init the parameter
@@ -182,7 +228,11 @@ def single_video_inference(video_path, model, model_args, overlap_window_length)
 
 
     # Read the Video
-    video_np_full, fps = _read_video_pyav(video_path, width=process_width, height=process_height)
+    # ĐÃ VÁ: truyền max_frames để tránh tràn RAM với video dài (xem docstring
+    # _read_video_pyav) — tham số mới, không có trong code gốc tác giả.
+    video_np_full, fps = _read_video_pyav(
+        video_path, width=process_width, height=process_height, max_frames=max_frames,
+    )
 
     # Iterate all the clips
     pred_boundary_full = []
