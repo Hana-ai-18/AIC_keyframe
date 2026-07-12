@@ -1048,85 +1048,6 @@ class TestAutoShotDetectorReal:
         assert result.stats["n_keyframes"] > 0
 
 
-class TestOmniShotCutDetector:
-    """
-    Test OmniShotCutDetector bằng MOCK model_wrapper (không cần tải checkpoint
-    thật từ HuggingFace — môi trường build không có internet ra huggingface.co).
-    Kiểm chứng logic chuyển đổi output của model (ranges, intra_labels,
-    inter_labels) sang List[Shot] đúng, độc lập với việc tải checkpoint thật.
-    """
-
-    def test_import_succeeds(self):
-        from aic_pipeline.shot_detector import OmniShotCutDetector
-        det = OmniShotCutDetector(device="cpu")
-        assert det.device == "cpu"
-
-    def test_detect_converts_model_output_to_shots(self, synthetic_video, monkeypatch):
-        from aic_pipeline.shot_detector import OmniShotCutDetector
-
-        class FakeModelWrapper:
-            def inference(self, video_path, mode="default", overlap=20):
-                # giả lập model trả về 3 shot: General, Dissolve, General
-                ranges = [[0, 75], [75, 125], [125, 250]]
-                intra_labels = [0, 1, 0]   # General, Dissolve, General
-                inter_labels = [1, 3, 1]   # Hard_Cut, Transition, Hard_Cut
-                return ranges, intra_labels, inter_labels
-
-        det = OmniShotCutDetector(device="cpu", min_shot_len=5)
-        det._model_wrapper = FakeModelWrapper()  # bỏ qua _load_model thật
-
-        shots = det.detect(synthetic_video)
-        assert len(shots) == 3
-        assert shots[0].boundary_type == "hard"     # General -> hard
-        assert shots[1].boundary_type == "gradual"  # Dissolve -> gradual
-        assert shots[2].boundary_type == "hard"
-
-    def test_clean_shot_mode_filters_transitions(self, synthetic_video):
-        from aic_pipeline.shot_detector import OmniShotCutDetector
-
-        class FakeModelWrapper:
-            def inference(self, video_path, mode="default", overlap=20):
-                ranges = [[0, 75], [75, 125], [125, 250]]
-                intra_labels = [0, 1, 0]
-                inter_labels = [1, 3, 1]
-                return ranges, intra_labels, inter_labels
-
-        det = OmniShotCutDetector(device="cpu", mode="clean_shot", min_shot_len=5)
-        det._model_wrapper = FakeModelWrapper()
-
-        shots = det.detect(synthetic_video)
-        # chỉ giữ 2 shot "General" (loại bỏ shot Dissolve ở giữa)
-        assert len(shots) == 2
-
-    def test_empty_model_output_raises_clear_error(self, synthetic_video):
-        from aic_pipeline.shot_detector import OmniShotCutDetector
-
-        class EmptyModelWrapper:
-            def inference(self, video_path, mode="default", overlap=20):
-                return [], [], []
-
-        det = OmniShotCutDetector(device="cpu")
-        det._model_wrapper = EmptyModelWrapper()
-
-        with pytest.raises(ValueError, match="không phát hiện được shot nào"):
-            det.detect(synthetic_video)
-
-    def test_integrates_with_run_pipeline(self, synthetic_video):
-        from aic_pipeline import PipelineConfig, run_pipeline
-        from aic_pipeline.shot_detector import OmniShotCutDetector
-
-        class FakeModelWrapper:
-            def inference(self, video_path, mode="default", overlap=20):
-                return [[0, 75], [75, 125], [125, 250]], [0, 1, 0], [1, 3, 1]
-
-        det = OmniShotCutDetector(device="cpu", min_shot_len=5)
-        det._model_wrapper = FakeModelWrapper()
-
-        config = PipelineConfig(shot_backend=det, store_images=False)
-        result = run_pipeline(synthetic_video, config)
-        assert result.stats["n_shots"] == 3
-        assert result.stats["n_keyframes"] > 0
-
 
 class TestOmniShotCutDetector:
     """
@@ -1243,4 +1164,112 @@ class TestOmniShotCutDetector:
         result = run_pipeline(synthetic_video, config)
         assert result.stats["n_shots"] > 0
         assert result.stats["n_keyframes"] > 0
+
+
+class TestOmniShotCutAV1Support:
+    """
+    Test QUAN TRỌNG NHẤT của patch PyAV: xác nhận OmniShotCutDetector đọc
+    được video mã hoá AV1 — codec mà decord (bản cuối 0.6.0, dự án đã ngừng
+    phát triển) KHÔNG hỗ trợ, gây lỗi DECORDError thật đã gặp trên Kaggle
+    (dataset AIC dùng codec av1). Patch thay decord bằng PyAV trong
+    _omnishotcut_vendor/omnishotcut/engine.py và __init__.py.
+    """
+
+    @pytest.fixture(scope="class")
+    def av1_video(self, tmp_path_factory, synthetic_video):
+        """Convert video test sang AV1 bằng ffmpeg để tái hiện đúng vấn đề thật."""
+        import subprocess
+        av1_path = str(tmp_path_factory.mktemp("av1") / "test_av1.mp4")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", synthetic_video, "-c:v", "libaom-av1",
+             "-crf", "30", "-cpu-used", "8", av1_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not os.path.exists(av1_path):
+            pytest.skip(f"Không tạo được video AV1 test (thiếu libaom-av1?): {result.stderr[:300]}")
+        return av1_path
+
+    def test_decord_fails_on_av1_baseline_proof(self, av1_video):
+        """Xác nhận ĐÚNG VẤN ĐỀ: decord (chưa patch) phải lỗi trên AV1 —
+        đây là bằng chứng nền để so sánh, không phải bug cần sửa ở đây."""
+        from decord import VideoReader, cpu as decord_cpu
+        with pytest.raises(Exception):  # DECORDError
+            VideoReader(av1_video, ctx=decord_cpu(0), width=224, height=224)
+
+    def test_pyav_reads_av1_successfully(self, av1_video):
+        """Hàm patch _read_video_pyav phải đọc được AV1 mà decord không đọc được."""
+        import sys
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+        from omnishotcut.engine import _read_video_pyav
+
+        video_np, fps = _read_video_pyav(av1_video, width=224, height=224)
+        assert video_np.ndim == 4
+        assert video_np.shape[1:] == (224, 224, 3)
+        assert video_np.shape[0] > 0
+        assert fps > 0
+
+    @classmethod
+    @pytest.fixture(scope="class")
+    def patch_no_pretrained_local(cls):
+        import sys
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+        from omnishotcut.architecture import backbone as backbone_module
+        original = backbone_module.is_main_process
+        backbone_module.is_main_process = lambda: False
+        yield
+        backbone_module.is_main_process = original
+
+    @classmethod
+    @pytest.fixture(scope="class")
+    def fake_checkpoint_local(cls, tmp_path_factory, patch_no_pretrained_local):
+        from types import SimpleNamespace
+        import torch
+        from omnishotcut.architecture.backbone import build_backbone
+        from omnishotcut.architecture.transformer import build_transformer
+        from omnishotcut.architecture.model import OmniShotCut
+
+        model_args = SimpleNamespace(
+            backbone="resnet50", dilation=False, lr_backbone=1e-5, masks=False,
+            hidden_dim=192, dropout=0.1, nheads=8, dim_feedforward=2048,
+            enc_layers=6, dec_layers=6, pre_norm=False, position_embedding="sine",
+            num_intra_relation_classes=9, num_inter_relation_classes=6,
+            max_process_window_length=16, num_queries=16, aux_loss=False,
+            process_height=224, process_width=224,
+        )
+        backbone = build_backbone(model_args)
+        transformer = build_transformer(model_args)
+        model = OmniShotCut(
+            backbone, transformer,
+            num_intra_relation_classes=model_args.num_intra_relation_classes,
+            num_inter_relation_classes=model_args.num_inter_relation_classes,
+            num_frames=model_args.max_process_window_length,
+            num_queries=model_args.num_queries,
+            aux_loss=model_args.aux_loss,
+        )
+        path = str(tmp_path_factory.mktemp("ckpt") / "fake.pth")
+        torch.save({"args": model_args, "model": model.state_dict()}, path)
+        return path
+
+    def test_omnishotcut_detector_full_flow_on_av1(
+        self, av1_video, fake_checkpoint_local, patch_no_pretrained_local
+    ):
+        """Test end-to-end quan trọng nhất: OmniShotCutDetector.detect() phải
+        chạy THÀNH CÔNG trên video AV1 — đúng chính xác tình huống lỗi thật
+        đã gặp trên Kaggle với dataset AIC (codec av1)."""
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+
+        det = OmniShotCutDetector(
+            checkpoint_path=fake_checkpoint_local, device="cpu",
+            min_shot_len=5, overlap_window_length=4,
+        )
+        shots = det.detect(av1_video)
+        assert len(shots) > 0, "Phải phát hiện được ít nhất 1 shot trên video AV1"
+        for s in shots:
+            assert s.start_frame < s.end_frame
 

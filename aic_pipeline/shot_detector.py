@@ -710,7 +710,20 @@ class OmniShotCutDetector:
     LƯU Ý QUAN TRỌNG VỀ MÔI TRƯỜNG: backbone dùng torchvision.models.resnet50
     với pretrained ImageNet weights — lần đầu chạy sẽ tự tải qua
     download.pytorch.org (cần Internet: On trên Kaggle). requirements.txt cần
-    thêm decord, omegaconf.
+    thêm decord, omegaconf, av.
+
+    ĐÃ VÁ CODEC AV1 (quan trọng với dataset AIC — dùng codec av1): code gốc
+    tác giả đọc video bằng decord.VideoReader, nhưng decord (bản cuối 0.6.0,
+    dự án đã ngừng phát triển từ lâu) KHÔNG hỗ trợ codec AV1 — gây lỗi
+    "DECORDError: cannot find video stream with wanted index: -1" khi gặp
+    video AV1. Đã thay bằng PyAV (thư viện `av`, bind trực tiếp FFmpeg hệ
+    thống, hỗ trợ AV1 đầy đủ qua libaom/dav1d) trong 2 file vendor
+    (engine.py và __init__.py) — hàm _read_video_pyav() tái tạo đúng API
+    output (T,H,W,3) RGB uint8 mà phần còn lại của code gốc mong đợi, KHÔNG
+    cần convert video sang H.264 trước, đọc thẳng AV1 với tốc độ tương đương.
+    ĐÃ KIỂM CHỨNG: tạo video AV1 test bằng ffmpeg, xác nhận decord lỗi (tái
+    hiện đúng lỗi thật) và PyAV đọc thành công, toàn bộ luồng detect() chạy
+    hết không lỗi (3 test mới, TestOmniShotCutAV1Support).
 
     ĐÃ VÁ FILE VENDOR (engine.py trong _omnishotcut_vendor/): code gốc tác
     giả hardcode .to("cuda") ở 3 chỗ (dòng model.to("cuda") và 2 chỗ

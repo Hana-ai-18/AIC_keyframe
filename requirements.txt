@@ -10,7 +10,9 @@ torch>=2.0.0   # bắt buộc cho AutoShotDetector thật, GPUShotDetector, Clip
 torchvision>=0.15.0   # bắt buộc cho OmniShotCutDetector
 einops>=0.6.0  # bắt buộc cho kiến trúc AutoShot (attention block)
 ffmpeg-python>=0.2.0   # bắt buộc cho AutoShotDetector thật (đọc frame đúng cách tác giả gốc)
-decord>=0.6.0   # bắt buộc cho OmniShotCutDetector (đọc video)
+decord>=0.6.0   # bắt buộc cho OmniShotCutDetector (chỉ dùng nội bộ trong training dataloader)
+av>=10.0.0   # bắt buộc — thay decord để ĐỌC VIDEO trong OmniShotCutDetector (decord 0.6.0
+             # là bản cuối, đã ngừng phát triển, KHÔNG hỗ trợ codec AV1 — dataset AIC dùng AV1)
 accelerate>=0.20.0   # bắt buộc cho OmniShotCutDetector
 omegaconf>=2.3.0   # bắt buộc cho OmniShotCutDetector (đọc model_args)
 

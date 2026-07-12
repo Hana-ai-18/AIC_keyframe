@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Output tạm khi chạy demo local (không phải video test cố ý đặt trong sample_data/)
+outputs/*.jpg
+outputs/_grid_overview.jpg
+
+# Không ignore *.mp4 — video trong sample_data/ là cố ý đặt vào repo để test trên Kaggle
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -5,11 +5,37 @@ import os, sys, shutil
 import argparse
 import numpy as np
 import copy
-from decord import VideoReader, cpu as decord_cpu
 import json
 import torch
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+# ĐÃ PATCH: thay decord bằng PyAV để đọc được codec AV1 (và các codec mới khác
+# mà decord — bản cuối 0.6.0, dự án đã ngừng phát triển — không hỗ trợ).
+# decord.VideoReader(path, width=W, height=H)[:].asnumpy() trả về (T,H,W,3) RGB
+# đã resize sẵn; _read_video_pyav() bên dưới tái tạo đúng API/output tương đương
+# để phần còn lại của file KHÔNG cần sửa gì thêm.
+import av
+import cv2
+
+
+def _read_video_pyav(video_path, width, height):
+    """Thay thế decord.VideoReader — trả về (video_np (T,H,W,3) RGB uint8, fps)."""
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    fps = float(stream.average_rate)
+
+    frames = []
+    for frame in container.decode(video=0):
+        img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
+        if width is not None and height is not None:
+            img = cv2.resize(img, (width, height))
+        frames.append(img)
+    container.close()
+
+    if not frames:
+        raise ValueError(f"Không đọc được frame nào từ video: {video_path}")
+    return np.stack(frames, axis=0), fps
 
 
 # Import files from the local folder
@@ -156,10 +182,7 @@ def single_video_inference(video_path, model, model_args, overlap_window_length)
 
 
     # Read the Video
-    vr = VideoReader(video_path, ctx=decord_cpu(0), width=process_width, height=process_height)
-    fps = vr.get_avg_fps()
-    video_np_full = vr[:].asnumpy()  # (T, H, W, 3), RGB
-    
+    video_np_full, fps = _read_video_pyav(video_path, width=process_width, height=process_height)
 
     # Iterate all the clips
     pred_boundary_full = []
