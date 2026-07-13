@@ -1273,3 +1273,73 @@ class TestOmniShotCutAV1Support:
         for s in shots:
             assert s.start_frame < s.end_frame
 
+
+class TestPyAVCorruptedStreamHandling:
+    """
+    Vá lỗi: video AV1 có phần STREAM BỊ LỖI THẬT (không chỉ thiếu hardware
+    accelerator) khiến FFmpeg lặp lại "Failed to get pixel format" / "Get
+    current frame error" cho MỌI packet còn lại — trước đây gây treo notebook
+    vô thời hạn. Đã vá bằng đếm số packet liên tiếp lỗi/rỗng, dừng sớm khi
+    vượt ngưỡng thay vì lặp vô hạn qua phần hỏng của file.
+    """
+
+    @pytest.fixture(scope="class")
+    def corrupted_av1_video(self, tmp_path_factory, synthetic_video):
+        import subprocess
+        import random
+
+        av1_path = str(tmp_path_factory.mktemp("av1c") / "good.mp4")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", synthetic_video, "-c:v", "libaom-av1",
+             "-crf", "30", "-cpu-used", "8", av1_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not os.path.exists(av1_path):
+            pytest.skip(f"Không tạo được video AV1 (thiếu libaom-av1?): {result.stderr[:300]}")
+
+        with open(av1_path, "rb") as f:
+            data = bytearray(f.read())
+        random.seed(42)
+        start, end = int(len(data) * 0.5), int(len(data) * 0.9)
+        for i in range(start, end):
+            data[i] = random.randint(0, 255)
+
+        corrupt_path = str(tmp_path_factory.mktemp("av1c") / "corrupt.mp4")
+        with open(corrupt_path, "wb") as f:
+            f.write(bytes(data))
+        return corrupt_path
+
+    def test_corrupted_stream_does_not_hang(self, corrupted_av1_video):
+        """Test QUAN TRỌNG NHẤT: đọc file có vùng dữ liệu bị hỏng phải HOÀN
+        TẤT trong thời gian hợp lý (không treo vô hạn), dùng timeout cứng
+        qua subprocess để đảm bảo test tự thất bại rõ ràng nếu bị treo thay
+        vì làm treo cả pytest."""
+        import subprocess
+        import sys as _sys
+
+        script = f"""
+import sys
+sys.path.insert(0, {repr(os.path.join(os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"))})
+from omnishotcut.engine import _read_video_pyav
+video_np, fps = _read_video_pyav({repr(corrupted_av1_video)}, width=224, height=224, max_frames=500)
+print("OK", video_np.shape)
+"""
+        result = subprocess.run(
+            [_sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=30,  # nếu treo, subprocess.run tự raise TimeoutExpired
+        )
+        assert "OK" in result.stdout, f"Không hoàn tất đúng: stdout={result.stdout}, stderr={result.stderr[-500:]}"
+
+    def test_corrupted_stream_returns_frames_before_corruption(self, corrupted_av1_video):
+        """Phải trả về đúng các frame đọc được TRƯỚC vùng hỏng, không phải
+        rỗng hoàn toàn (vùng hỏng ở 50%-90% file, nên phải có frame từ 0-50%)."""
+        import sys
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+        from omnishotcut.engine import _read_video_pyav
+
+        video_np, fps = _read_video_pyav(corrupted_av1_video, width=224, height=224, max_frames=500)
+        assert video_np.shape[0] > 0, "Phải đọc được ít nhất vài frame trước vùng hỏng"
+

@@ -66,16 +66,51 @@ def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=No
     frame_idx = 0
     # Đọc theo PACKET (demux) rồi mới decode từng packet — thay vì generator
     # decode() có thể đã buffer/giải mã ngầm nhiều frame phía trước trước khi
-    # Python kịp break, gây ra hàng loạt warning FFmpeg (đặc biệt rõ với AV1
-    # phải fallback software decode) tiếp tục xuất hiện dù đã "break". Đọc
-    # theo packet cho phép dừng NGAY sau khi đã đủ max_frames, không decode
-    # dư thêm bất kỳ packet nào phía sau.
+    # Python kịp break, gây ra hàng loạt warning FFmpeg tiếp tục xuất hiện dù
+    # đã "break". Đọc theo packet cho phép dừng NGAY sau khi đã đủ max_frames.
     stream.thread_type = "AUTO"  # cho phép FFmpeg dùng multi-thread decode nếu có, nhanh hơn
     stopped_early = False
+
+    # ĐÃ VÁ THÊM: một số video AV1 có phần STREAM BỊ LỖI THẬT (không chỉ thiếu
+    # hardware accelerator) — FFmpeg báo "Failed to get pixel format" / "Get
+    # current frame error" và lặp lại lỗi này cho MỌI packet còn lại của file
+    # (lỗi decode dây chuyền), khiến vòng lặp chạy "vô hạn" trên thực tế (hết
+    # packet lỗi này đến packet lỗi khác, dù mỗi packet.decode() không tự
+    # raise exception mà chỉ log warning rồi trả về rỗng). Vá bằng cách đếm
+    # số packet LIÊN TIẾP không cho ra được frame nào — nếu vượt ngưỡng, coi
+    # như phần còn lại của stream hỏng, DỪNG HẲN và dùng frame đã có (thay vì
+    # tiếp tục chạy vô ích qua hàng chục nghìn packet lỗi).
+    consecutive_empty_packets = 0
+    max_consecutive_empty = 200  # ~vài giây video hỏng liên tục thì coi là hỏng thật
+
     for packet in container.demux(video=0):
-        for frame in packet.decode():
+        try:
+            decoded_this_packet = packet.decode()
+        except Exception as e:
+            decoded_this_packet = []
+            _logger_video_read.debug(f"Bỏ qua 1 packet lỗi decode: {e}")
+
+        if not decoded_this_packet:
+            consecutive_empty_packets += 1
+            if consecutive_empty_packets >= max_consecutive_empty:
+                _logger_video_read.warning(
+                    f"Phát hiện {consecutive_empty_packets} packet liên tiếp decode lỗi/rỗng "
+                    f"(stream AV1 có thể bị hỏng một phần) — DỪNG SỚM, dùng "
+                    f"{len(frames)} frame đã đọc được thay vì tiếp tục qua phần hỏng."
+                )
+                break
+            continue
+        else:
+            consecutive_empty_packets = 0
+
+        for frame in decoded_this_packet:
             if frame_idx % frame_stride == 0:
-                img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
+                try:
+                    img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
+                except Exception as e:
+                    _logger_video_read.debug(f"Bỏ qua 1 frame lỗi convert: {e}")
+                    frame_idx += 1
+                    continue
                 if width is not None and height is not None:
                     img = cv2.resize(img, (width, height))
                 frames.append(img)
