@@ -32,7 +32,10 @@ from .object_graph import (
     build_object_graph, summarize_graph_for_query, ObjectGraph, ObjectTrack,
     ObjectGraphEdge, DetectedObject, ContourFallbackDetector, YoloDetector,
 )
-from .pipeline import run_pipeline, run_pipeline_batch, PipelineConfig, PipelineResult
+from .pipeline import (
+    run_pipeline, run_pipeline_optimized, run_pipeline_batch, run_pipeline_batch_parallel,
+    PipelineConfig, PipelineResult,
+)
 from .streaming_batch import run_pipeline_fast, FastPipelineConfig, FastPipelineResult
 
 __all__ = [
@@ -45,7 +48,8 @@ __all__ = [
     "TemporalReranker", "StageHit", "ChainResult",
     "build_object_graph", "summarize_graph_for_query", "ObjectGraph", "ObjectTrack",
     "ObjectGraphEdge", "DetectedObject", "ContourFallbackDetector", "YoloDetector",
-    "run_pipeline", "run_pipeline_batch", "PipelineConfig", "PipelineResult",
+    "run_pipeline", "run_pipeline_optimized", "run_pipeline_batch", "run_pipeline_batch_parallel",
+    "PipelineConfig", "PipelineResult",
     "run_pipeline_fast", "FastPipelineConfig", "FastPipelineResult",
 ]
 

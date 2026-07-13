@@ -1467,3 +1467,65 @@ class TestVideoReaderCoversFullDuration:
             f"fps hiệu dụng phải xấp xỉ 3.0 (30/10), được {fps_effective}"
         )
 
+
+class TestPipelineOptimizedAndParallel:
+    """
+    Vá tốc độ: run_pipeline() gốc đọc video 2 LẦN RIÊNG BIỆT (Tầng 2 + Tầng
+    4), tốn gấp đôi chi phí decode với video AV1 dài. run_pipeline_optimized()
+    preload video 1 LẦN, dùng chung qua cache của video_reader.py — đã đo
+    thực tế trên video AIC: giảm ~1.8x thời gian (36.2s -> 19.7s cho phần
+    motion+frame_selection). run_pipeline_batch_parallel() chạy song song
+    nhiều video bằng multiprocessing, cho batch lớn (mục tiêu 700 video/2-3
+    ngày).
+    """
+
+    def test_run_pipeline_optimized_matches_run_pipeline_result(self, synthetic_video):
+        from aic_pipeline import run_pipeline, run_pipeline_optimized, PipelineConfig
+        config = PipelineConfig(store_images=False)
+
+        result_old = run_pipeline(synthetic_video, config)
+        result_new = run_pipeline_optimized(synthetic_video, config)
+
+        assert result_old.stats["n_shots"] == result_new.stats["n_shots"]
+        assert result_old.stats["n_keyframes"] == result_new.stats["n_keyframes"]
+        assert result_old.stats["motion_class_distribution"] == result_new.stats["motion_class_distribution"]
+
+    def test_run_pipeline_optimized_has_preload_timing(self, synthetic_video):
+        from aic_pipeline import run_pipeline_optimized, PipelineConfig
+        result = run_pipeline_optimized(synthetic_video, PipelineConfig(store_images=False))
+        assert "video_preload" in result.stats["timing_seconds"]
+
+    def test_batch_parallel_matches_batch_sequential(self, tmp_path, synthetic_video):
+        import shutil
+        video_dir = tmp_path / "videos"
+        video_dir.mkdir()
+        for i in range(3):
+            shutil.copy(synthetic_video, video_dir / f"v{i}.mp4")
+
+        from aic_pipeline import run_pipeline_batch, run_pipeline_batch_parallel, PipelineConfig
+        config = PipelineConfig(store_images=False)
+
+        results_seq = run_pipeline_batch(str(video_dir), config)
+        results_par = run_pipeline_batch_parallel(str(video_dir), config, n_workers=2)
+
+        assert len(results_seq) == len(results_par) == 3
+        for v in results_seq:
+            assert results_seq[v].stats["n_shots"] == results_par[v].stats["n_shots"]
+            assert results_seq[v].stats["n_keyframes"] == results_par[v].stats["n_keyframes"]
+
+    def test_batch_parallel_handles_error_video_gracefully(self, tmp_path, synthetic_video):
+        import shutil
+        video_dir = tmp_path / "videos"
+        video_dir.mkdir()
+        shutil.copy(synthetic_video, video_dir / "good.mp4")
+        (video_dir / "broken.mp4").write_bytes(b"not a real video")
+
+        from aic_pipeline import run_pipeline_batch_parallel, PipelineConfig
+        results = run_pipeline_batch_parallel(str(video_dir), PipelineConfig(store_images=False), n_workers=2)
+
+        assert len(results) == 2
+        good_result = [r for p, r in results.items() if "good" in p][0]
+        broken_result = [r for p, r in results.items() if "broken" in p][0]
+        assert good_result.error is None
+        assert broken_result.error is not None
+
