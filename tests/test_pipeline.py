@@ -1646,3 +1646,97 @@ class TestOmniShotCutFullVideoCoverage:
         assert video_np.shape[0] > 0
         assert fps_eff > 0
 
+
+class TestEnsembleEmbedder:
+    """
+    Cho phép kết hợp nhiều embedder (CLIP + SigLIP2) đúng tinh thần ensemble
+    mà nghiên cứu 2025 dùng (BEiT-3 + SigLIP2). Test bằng fake embedder
+    (không cần tải model thật) để kiểm chứng logic concat + normalize riêng
+    từng phần, độc lập với việc tải model thành công hay không.
+    """
+
+    @staticmethod
+    def _make_fake_embedder(dim, seed):
+        import numpy as np
+
+        class FakeEmbedder:
+            def encode_images(self, images):
+                rng = np.random.RandomState(seed)
+                return rng.randn(len(images), dim).astype(np.float32)
+
+            def unload(self):
+                pass
+
+        return FakeEmbedder()
+
+    def test_ensemble_concatenates_dimensions_correctly(self):
+        import numpy as np
+        from aic_pipeline.embeddings import EnsembleEmbedder
+
+        e1 = self._make_fake_embedder(512, 1)
+        e2 = self._make_fake_embedder(768, 2)
+        ensemble = EnsembleEmbedder([e1, e2])
+
+        images = [np.zeros((10, 10, 3), dtype=np.uint8)] * 3
+        vecs = ensemble.encode_images(images)
+        assert vecs.shape == (3, 512 + 768)
+
+    def test_ensemble_normalizes_each_part_separately(self):
+        import numpy as np
+        from aic_pipeline.embeddings import EnsembleEmbedder
+
+        e1 = self._make_fake_embedder(512, 1)
+        e2 = self._make_fake_embedder(768, 2)
+        ensemble = EnsembleEmbedder([e1, e2])
+
+        images = [np.zeros((10, 10, 3), dtype=np.uint8)] * 3
+        vecs = ensemble.encode_images(images)
+
+        part1_norms = np.linalg.norm(vecs[:, :512], axis=1)
+        part2_norms = np.linalg.norm(vecs[:, 512:], axis=1)
+        assert np.allclose(part1_norms, 1.0, atol=1e-5), (
+            "Phần embedder đầu phải được L2-normalize riêng trước khi concat, "
+            "tránh 1 model có norm lớn hơn lấn át model kia trong farthest-point-sampling."
+        )
+        assert np.allclose(part2_norms, 1.0, atol=1e-5)
+
+    def test_ensemble_requires_at_least_one_embedder(self):
+        from aic_pipeline.embeddings import EnsembleEmbedder
+        import pytest as _pytest
+        with _pytest.raises(ValueError):
+            EnsembleEmbedder([])
+
+    def test_ensemble_empty_images_returns_empty(self):
+        from aic_pipeline.embeddings import EnsembleEmbedder
+        e1 = self._make_fake_embedder(512, 1)
+        ensemble = EnsembleEmbedder([e1])
+        vecs = ensemble.encode_images([])
+        assert vecs.shape[0] == 0
+
+    def test_ensemble_integrates_with_frame_selector(self, synthetic_video):
+        """Test QUAN TRỌNG: xác nhận EnsembleEmbedder cắm thẳng vào
+        select_keyframes() không cần sửa frame_selector.py."""
+        from aic_pipeline.frame_selector import select_keyframes
+        from aic_pipeline.shot_detector import Shot
+        from aic_pipeline.embeddings import EnsembleEmbedder
+
+        e1 = self._make_fake_embedder(512, 1)
+        e2 = self._make_fake_embedder(768, 2)
+        ensemble = EnsembleEmbedder([e1, e2])
+
+        shot = Shot(shot_id=0, start_frame=0, end_frame=75, start_time=0.0, end_time=3.0)
+        kfs = select_keyframes(
+            synthetic_video, shot, n_keyframes=3,
+            feature_mode="semantic", embedder=ensemble,
+            store_images=False, store_embeddings=True,
+        )
+        assert len(kfs) > 0
+        assert kfs[0].embedding.shape == (1280,)
+
+    def test_siglip_embedder_import_does_not_crash_without_network(self):
+        """SiglipEmbedder phải import/khởi tạo được (chỉ lỗi khi thực sự gọi
+        encode_images cần tải model qua mạng) — kiểm tra lazy-loading đúng."""
+        from aic_pipeline.embeddings import SiglipEmbedder
+        embedder = SiglipEmbedder(device="cpu")
+        assert embedder._model is None  # chưa load, đúng thiết kế lazy
+
