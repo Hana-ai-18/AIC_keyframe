@@ -305,11 +305,25 @@ def run_pipeline_batch(
 
 
 def _process_one_video_for_parallel(args):
-    """Hàm worker cho multiprocessing — PHẢI ở module level (không phải nested
-    function/lambda) để pickle được khi truyền vào Pool.map()."""
-    video_path, config, use_optimized = args
+    """
+    Hàm worker cho multiprocessing — PHẢI ở module level để pickle được.
+
+    ĐÃ VÁ LỖI NGHIÊM TRỌNG: bản đầu nhận thẳng `config` (PipelineConfig) đã
+    có model load sẵn (config.shot_backend._model là PyTorch model trên
+    GPU, config.embedder cũng vậy) — multiprocessing.Pool PHẢI pickle mọi
+    argument để gửi sang worker process, nhưng PyTorch model/CUDA context
+    KHÔNG pickle được ("TypeError: cannot pickle 'module' object").
+
+    Sửa bằng FACTORY PATTERN: worker nhận `config_factory` (một hàm KHÔNG
+    tham số, trả về PipelineConfig mới) thay vì config đã có sẵn model —
+    hàm này pickle được (chỉ là tham chiếu function, không phải state nặng),
+    và mỗi worker process TỰ GỌI factory để load model RIÊNG của mình bên
+    trong process con — đúng cách dùng GPU với multiprocessing.
+    """
+    video_path, config_factory, use_optimized = args
     import traceback as _tb
     try:
+        config = config_factory()
         fn = run_pipeline_optimized if use_optimized else run_pipeline
         result = fn(video_path, config)
         return video_path, result, None
@@ -320,7 +334,7 @@ def _process_one_video_for_parallel(args):
 
 def run_pipeline_batch_parallel(
     video_dir: str,
-    config: Optional[PipelineConfig] = None,
+    config_factory,
     pattern: str = "*.mp4",
     limit: Optional[int] = None,
     n_workers: Optional[int] = None,
@@ -332,34 +346,64 @@ def run_pipeline_batch_parallel(
     — chạy song song scale gần tuyến tính theo số core, không bị giới hạn
     bởi GIL vì mỗi video chạy trong process riêng).
 
-    Vì sao cần cho mục tiêu "700 video trong 2-3 ngày": đo thực tế 1 video
-    15 phút tốn ~280s TUẦN TỰ (một phần đã giảm nhờ run_pipeline_optimized).
-    700 video tuần tự = 700 * 280s ≈ 54.4 giờ (~2.3 ngày) — CHỈ VỪA ĐỦ nếu
-    chạy tuần tự với model GPU chiếm phần lớn thời gian. Chạy song song
-    n_workers video cùng lúc (mỗi worker vẫn dùng chung 1 GPU cho model, chỉ
-    phần đọc/decode video và tính CPU chạy song song) giảm thời gian theo hệ
-    số gần n_workers (với 4 CPU core: gần 4x nhanh hơn cho phần I/O).
+    QUAN TRỌNG — THAM SỐ ĐÃ ĐỔI (không còn nhận PipelineConfig trực tiếp):
+    nhận `config_factory` — MỘT HÀM KHÔNG THAM SỐ trả về PipelineConfig mới
+    mỗi lần gọi — thay vì 1 PipelineConfig đã tạo sẵn. Lý do: nếu truyền
+    thẳng config đã có model load sẵn (OmniShotCutDetector/ClipEmbedder đã
+    .to("cuda")), multiprocessing.Pool sẽ CRASH khi cố pickle model để gửi
+    sang worker process ("cannot pickle 'module' object"). Factory function
+    cho phép MỖI WORKER TỰ LOAD MODEL RIÊNG bên trong process con của nó —
+    đây là cách dùng đúng khi kết hợp GPU model với multiprocessing.
 
-    LƯU Ý QUAN TRỌNG VỀ GPU: nếu config.shot_backend hoặc config.embedder
-    dùng GPU (OmniShotCutDetector, ClipEmbedder), mỗi worker process sẽ tự
-    load model RIÊNG lên GPU — với n_workers lớn có thể TRÀN VRAM. Khuyến
-    nghị: n_workers = 2-3 cho GPU T4 (16GB VRAM), không phải bằng số CPU
-    core. Test trước với n_workers=2 để đo VRAM thực tế trước khi tăng.
+    CÁCH DÙNG — thay vì:
+        config = PipelineConfig(shot_backend=detector, embedder=embedder, ...)
+        run_pipeline_batch_parallel(video_dir, config)   # SAI — sẽ crash
+
+    Viết thành factory:
+        def make_config():
+            detector = make_omnishotcut_detector(device="cuda", max_frames=6000)
+            embedder = ClipEmbedder(device="cuda")
+            return PipelineConfig(
+                shot_backend=detector, feature_mode="semantic", embedder=embedder,
+                store_images=True, store_embeddings=True, global_budget=None,
+            )
+        run_pipeline_batch_parallel(video_dir, make_config, n_workers=2)
+
+    LƯU Ý QUAN TRỌNG VỀ GPU: mỗi worker tự load model RIÊNG lên GPU — với
+    n_workers lớn có thể TRÀN VRAM (mỗi OmniShotCut+CLIP có thể tốn 2-4GB).
+    Khuyến nghị: n_workers=2 cho GPU T4 (16GB VRAM). Test trước, theo dõi
+    bằng !nvidia-smi trước khi tăng.
 
     Args:
+        config_factory: hàm không tham số, trả về PipelineConfig MỚI mỗi
+                        lần gọi (mỗi worker gọi 1 lần khi bắt đầu xử lý video
+                        đầu tiên của nó — KHÔNG phải mỗi video, để tránh load
+                        lại model liên tục trong cùng 1 worker).
+
+                        RÀNG BUỘC QUAN TRỌNG CỦA PYTHON (không phải giới hạn
+                        riêng của hàm này): config_factory PHẢI là 1 hàm
+                        được định nghĩa ở MODULE LEVEL (top-level của 1 file
+                        .py hoặc 1 cell notebook, dùng `def tên_hàm():`),
+                        KHÔNG được là:
+                          - hàm lồng bên trong hàm/class khác (nested function)
+                          - lambda
+                          - hàm định nghĩa trong __main__ của notebook nếu
+                            notebook không hỗ trợ pickle closure
+                        Lý do: multiprocessing.Pool cần pickle config_factory
+                        để gửi cho worker process — Python chỉ pickle được
+                        function tham chiếu bằng tên đầy đủ (module.function),
+                        không pickle được nested function/lambda. Nếu vi phạm,
+                        sẽ gặp lỗi "Can't pickle local object" (khác lỗi
+                        "cannot pickle module object" khi model được tạo sẵn).
         n_workers: số process chạy song song. None = tự động dùng
-                   min(4, cpu_count()) — nhưng xem lưu ý VRAM ở trên, nên tự
-                   set rõ ràng (khuyến nghị 2-3) thay vì để mặc định nếu
-                   dùng GPU.
-        use_optimized: True = dùng run_pipeline_optimized() cho mỗi video
-                       (khuyến nghị, đã đo nhanh hơn ~1.8x so với run_pipeline).
+                   min(4, cpu_count()) — nên tự set 2 nếu dùng GPU.
+        use_optimized: True = dùng run_pipeline_optimized() cho mỗi video.
 
     Returns:
         Dict {video_path: PipelineResult}, giống hệt run_pipeline_batch().
     """
     import multiprocessing as mp
 
-    config = config or PipelineConfig()
     video_paths = sorted(glob.glob(os.path.join(video_dir, pattern)))
     if limit is not None:
         video_paths = video_paths[:limit]
@@ -377,7 +421,7 @@ def run_pipeline_batch_parallel(
         f"(use_optimized={use_optimized})..."
     )
 
-    tasks = [(vp, config, use_optimized) for vp in video_paths]
+    tasks = [(vp, config_factory, use_optimized) for vp in video_paths]
     results: Dict[str, PipelineResult] = {}
 
     t_start = time.time()

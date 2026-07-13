@@ -1468,6 +1468,32 @@ class TestVideoReaderCoversFullDuration:
         )
 
 
+def _make_config_for_test():
+    """PHẢI ở module level (không phải nested trong class/method) để
+    multiprocessing.Pool pickle được — đây là ràng buộc THẬT của Python
+    multiprocessing, không phải giới hạn riêng của package này."""
+    from aic_pipeline import PipelineConfig
+    return PipelineConfig(store_images=False)
+
+
+def _make_config_with_unpicklable_backend_for_test():
+    """Cũng PHẢI ở module level — mô phỏng backend chứa object không pickle
+    được (threading.Lock, giống PyTorch model/CUDA context thật), tạo BÊN
+    TRONG factory (chạy trong worker process) thay vì truyền sẵn qua Pool."""
+    import threading
+    from aic_pipeline import PipelineConfig
+    from aic_pipeline.shot_detector import HistogramSSIMDetector
+
+    class UnpicklableBackend:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def detect(self, video_path):
+            return HistogramSSIMDetector().detect(video_path)
+
+    return PipelineConfig(shot_backend=UnpicklableBackend(), store_images=False)
+
+
 class TestPipelineOptimizedAndParallel:
     """
     Vá tốc độ: run_pipeline() gốc đọc video 2 LẦN RIÊNG BIỆT (Tầng 2 + Tầng
@@ -1502,11 +1528,10 @@ class TestPipelineOptimizedAndParallel:
         for i in range(3):
             shutil.copy(synthetic_video, video_dir / f"v{i}.mp4")
 
-        from aic_pipeline import run_pipeline_batch, run_pipeline_batch_parallel, PipelineConfig
-        config = PipelineConfig(store_images=False)
+        from aic_pipeline import run_pipeline_batch, run_pipeline_batch_parallel
 
-        results_seq = run_pipeline_batch(str(video_dir), config)
-        results_par = run_pipeline_batch_parallel(str(video_dir), config, n_workers=2)
+        results_seq = run_pipeline_batch(str(video_dir), _make_config_for_test())
+        results_par = run_pipeline_batch_parallel(str(video_dir), _make_config_for_test, n_workers=2)
 
         assert len(results_seq) == len(results_par) == 3
         for v in results_seq:
@@ -1520,12 +1545,36 @@ class TestPipelineOptimizedAndParallel:
         shutil.copy(synthetic_video, video_dir / "good.mp4")
         (video_dir / "broken.mp4").write_bytes(b"not a real video")
 
-        from aic_pipeline import run_pipeline_batch_parallel, PipelineConfig
-        results = run_pipeline_batch_parallel(str(video_dir), PipelineConfig(store_images=False), n_workers=2)
+        from aic_pipeline import run_pipeline_batch_parallel
+
+        results = run_pipeline_batch_parallel(str(video_dir), _make_config_for_test, n_workers=2)
 
         assert len(results) == 2
         good_result = [r for p, r in results.items() if "good" in p][0]
         broken_result = [r for p, r in results.items() if "broken" in p][0]
         assert good_result.error is None
         assert broken_result.error is not None
+
+    def test_batch_parallel_config_factory_with_unpicklable_object(self, tmp_path, synthetic_video):
+        """
+        Test QUAN TRỌNG NHẤT: xác nhận factory pattern né được đúng lỗi thật
+        đã gặp trên Kaggle ("cannot pickle 'module' object") — mô phỏng model
+        chứa object KHÔNG pickle được (threading.Lock, giống CUDA context
+        thật), tạo object đó BÊN TRONG factory (chạy trong worker process),
+        không truyền thẳng object đã tạo sẵn qua Pool.
+        """
+        import shutil
+        video_dir = tmp_path / "videos"
+        video_dir.mkdir()
+        shutil.copy(synthetic_video, video_dir / "v0.mp4")
+
+        from aic_pipeline import run_pipeline_batch_parallel
+
+        results = run_pipeline_batch_parallel(
+            str(video_dir), _make_config_with_unpicklable_backend_for_test, n_workers=1,
+        )
+        assert len(results) == 1
+        result = list(results.values())[0]
+        assert result.error is None, f"Không được lỗi pickle: {result.error}"
+        assert result.stats["n_shots"] > 0
 
