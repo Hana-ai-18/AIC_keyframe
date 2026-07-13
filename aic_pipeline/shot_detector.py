@@ -879,6 +879,42 @@ class OmniShotCutDetector:
                 )
             )
 
+        # ĐÃ VÁ BUG NGHIÊM TRỌNG #4 (phát hiện qua báo cáo thực tế: video
+        # 1090.5s nhưng shot cuối chỉ tới 999.9s, thiếu 90.6s) — NGUYÊN NHÂN
+        # KHÁC với bug #3 đã vá trước đó (đã xác nhận video_np_full đọc đúng
+        # đủ 100% thời lượng). Đây là hạn chế THẬT của chính model OmniShotCut
+        # ở cửa sổ trượt CUỐI CÙNG: khi phần dữ liệu thật còn lại ít hơn
+        # max_process_window_length, cửa sổ cuối bị PADDING BẰNG KHUNG ĐEN
+        # (xem split_videos() trong engine.py, dòng "black = np.zeros(...)")
+        # — nếu phần khung đen chiếm đa số cửa sổ, model dễ không đưa ra
+        # được boundary hợp lệ nào cho đoạn cuối thật, khiến pred_ranges_full
+        # kết thúc sớm hơn video thật.
+        #
+        # Vá bằng hậu xử lý: so sánh shot cuối cùng với TỔNG SỐ FRAME THẬT ĐÃ
+        # ĐỌC (video_np_full.shape[0], đáng tin cậy vì đã xác nhận đọc đúng
+        # 100% video ở Tầng đọc video) — nếu còn thiếu, TỰ THÊM 1 SHOT bổ
+        # sung phủ đúng phần còn lại, đảm bảo không video nào bị bỏ sót hoàn
+        # toàn 1 đoạn cuối dù model gốc dự đoán thiếu.
+        total_frames_read = _video_np.shape[0] if _video_np is not None else None
+        if total_frames_read is not None and shots:
+            last_shot_end = shots[-1].end_frame
+            if last_shot_end < total_frames_read:
+                gap_frames = total_frames_read - last_shot_end
+                gap_seconds = gap_frames / fps
+                logger.warning(
+                    f"Model OmniShotCut bỏ sót {gap_seconds:.1f}s cuối video "
+                    f"(cửa sổ cuối bị padding khung đen làm nhiễu dự đoán) — "
+                    f"TỰ ĐỘNG THÊM 1 shot bổ sung phủ đúng phần còn thiếu, "
+                    f"thay vì bỏ sót hoàn toàn."
+                )
+                shots.append(
+                    Shot(
+                        shot_id=len(shots), start_frame=last_shot_end, end_frame=total_frames_read,
+                        start_time=last_shot_end / fps, end_time=total_frames_read / fps,
+                        boundary_type="hard", confidence=0.5,  # confidence thấp hơn — đây là suy luận, không phải model dự đoán trực tiếp
+                    )
+                )
+
         boundaries = [shots[0].start_frame] + [s.end_frame for s in shots]
         merged_boundaries = HistogramSSIMDetector._enforce_min_len(boundaries, self.min_shot_len)
         if merged_boundaries != boundaries:

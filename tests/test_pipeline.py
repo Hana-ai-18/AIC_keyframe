@@ -1740,3 +1740,88 @@ class TestEnsembleEmbedder:
         embedder = SiglipEmbedder(device="cpu")
         assert embedder._model is None  # chưa load, đúng thiết kế lazy
 
+
+class TestOmniShotCutGapAtEndAutoFix:
+    """
+    Vá bug NGHIÊM TRỌNG #4 (phát hiện qua báo cáo thực tế: video 1090.5s đọc
+    đúng 100% nhưng model OmniShotCut chỉ dự đoán shot tới 999.9s, thiếu
+    90.6s cuối). Nguyên nhân: cửa sổ trượt CUỐI CÙNG bị padding khung đen khi
+    không đủ dữ liệu thật, khiến model không đưa ra boundary hợp lệ cho đoạn
+    cuối. Đã vá bằng hậu xử lý: so sánh shot cuối với tổng frame ĐÃ ĐỌC THẬT
+    (video_np_full.shape[0]), tự thêm shot bổ sung nếu thiếu.
+    """
+
+    def test_gap_at_end_is_auto_filled(self, monkeypatch, synthetic_video):
+        """Test QUAN TRỌNG NHẤT: mô phỏng đúng tình huống model bỏ sót đoạn
+        cuối bằng monkeypatch single_video_inference, xác nhận detect() tự
+        động thêm shot bổ sung phủ đúng phần thiếu."""
+        import sys
+        import numpy as np
+
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+
+        det = OmniShotCutDetector(checkpoint_path="/fake/path", device="cpu")
+        det._model = object()  # bypass _load_model, không cần checkpoint thật
+        det._model_args = object()
+
+        # Mô phỏng: model chỉ dự đoán 1 shot tới frame 900 (90s theo fps=10),
+        # nhưng video_np_full thật có 1200 frame (120s) -> thiếu 30s cuối.
+        fake_video_np = np.zeros((1200, 10, 10, 3), dtype=np.uint8)
+
+        def fake_single_video_inference(video_path, model, model_args, overlap, max_frames):
+            pred_ranges = [(0, 900)]
+            pred_intra_labels = [0]
+            pred_inter_labels = [0]
+            fps = 10.0
+            return pred_ranges, pred_intra_labels, pred_inter_labels, fake_video_np, fps
+
+        import omnishotcut.engine as engine_module
+        monkeypatch.setattr(engine_module, "single_video_inference", fake_single_video_inference)
+
+        shots = det.detect(synthetic_video)
+
+        assert len(shots) == 2, f"Phải có 2 shot (1 gốc + 1 bổ sung), được {len(shots)}"
+        assert abs(shots[-1].end_time - 120.0) < 0.1, (
+            f"Shot cuối phải phủ tới 120s (tổng frame thật), được {shots[-1].end_time}s"
+        )
+        assert shots[-1].confidence < 1.0, (
+            "Shot bổ sung phải có confidence thấp hơn (đây là suy luận, không "
+            "phải model dự đoán trực tiếp) để dễ phân biệt khi debug."
+        )
+
+    def test_no_gap_does_not_add_extra_shot(self, monkeypatch, synthetic_video):
+        """Nếu model đã phủ đủ hết video, KHÔNG được tự thêm shot thừa."""
+        import sys
+        import numpy as np
+
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+
+        det = OmniShotCutDetector(checkpoint_path="/fake/path", device="cpu")
+        det._model = object()
+        det._model_args = object()
+
+        fake_video_np = np.zeros((900, 10, 10, 3), dtype=np.uint8)
+
+        def fake_single_video_inference(video_path, model, model_args, overlap, max_frames):
+            pred_ranges = [(0, 900)]  # đã phủ đúng hết 900 frame
+            pred_intra_labels = [0]
+            pred_inter_labels = [0]
+            fps = 10.0
+            return pred_ranges, pred_intra_labels, pred_inter_labels, fake_video_np, fps
+
+        import omnishotcut.engine as engine_module
+        monkeypatch.setattr(engine_module, "single_video_inference", fake_single_video_inference)
+
+        shots = det.detect(synthetic_video)
+        assert len(shots) == 1, f"Không được thêm shot thừa khi đã phủ đủ, được {len(shots)} shot"
+
