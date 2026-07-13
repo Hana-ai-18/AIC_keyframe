@@ -26,6 +26,7 @@ from .shot_detector import (
 from .motion_scorer import score_motion, MotionProfile, calibrate_thresholds, auto_calibrate_thresholds_gmm
 from .budget_allocator import allocate_budget, allocate_budget_with_global_cap, ShotBudget
 from .frame_selector import select_keyframes, Keyframe
+from .video_reader import get_video_frames, get_frame_range_by_time, clear_cache as clear_video_cache
 from .temporal_reranker import TemporalReranker, StageHit, ChainResult
 from .object_graph import (
     build_object_graph, summarize_graph_for_query, ObjectGraph, ObjectTrack,
@@ -40,6 +41,7 @@ __all__ = [
     "score_motion", "MotionProfile", "calibrate_thresholds", "auto_calibrate_thresholds_gmm",
     "allocate_budget", "allocate_budget_with_global_cap", "ShotBudget",
     "select_keyframes", "Keyframe",
+    "get_video_frames", "get_frame_range_by_time", "clear_video_cache",
     "TemporalReranker", "StageHit", "ChainResult",
     "build_object_graph", "summarize_graph_for_query", "ObjectGraph", "ObjectTrack",
     "ObjectGraphEdge", "DetectedObject", "ContourFallbackDetector", "YoloDetector",
@@ -47,4 +49,4 @@ __all__ = [
     "run_pipeline_fast", "FastPipelineConfig", "FastPipelineResult",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

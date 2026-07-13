@@ -142,28 +142,33 @@ def select_keyframes(
     if feature_mode not in ("cheap", "semantic"):
         raise ValueError(f"feature_mode phải là 'cheap' hoặc 'semantic', được: {feature_mode}")
 
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, shot.start_frame)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    # ĐÃ VÁ BUG NGHIÊM TRỌNG: trước đây dùng cv2.VideoCapture — KHÔNG hỗ trợ
+    # codec AV1 (dataset AIC dùng AV1), khiến cap.read() trả ret=False ngay
+    # từ frame đầu, hàm luôn trả về [] (0 keyframe) dù shot hợp lệ. Dùng
+    # video_reader (PyAV, đã hỗ trợ AV1) thay thế.
+    #
+    # DÙNG start_time/end_time (giây, LUÔN ĐÚNG) thay vì start_frame/end_frame
+    # (có thể sai hệ quy chiếu nếu detector — như OmniShotCutDetector — tính
+    # frame theo fps đã subsample khác fps gốc của video_reader).
+    from .video_reader import get_frame_range_by_time, get_video_frames
+
+    frame_indices_range, frames_bgr = get_frame_range_by_time(video_path, shot.start_time, shot.end_time)
+    _all_frames, fps = get_video_frames(video_path)
 
     candidates_idx: List[int] = []
     candidates_img: List[np.ndarray] = []
     sharpness_list: List[float] = []
     exposure_list: List[float] = []
 
-    frame_pos = shot.start_frame
-    while frame_pos < shot.end_frame:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if (frame_pos - shot.start_frame) % frame_stride == 0:
+    range_start = frame_indices_range[0] if frame_indices_range else 0
+    for local_i, global_frame_idx in enumerate(frame_indices_range):
+        if (global_frame_idx - range_start) % frame_stride == 0:
+            frame = frames_bgr[local_i]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            candidates_idx.append(frame_pos)
+            candidates_idx.append(global_frame_idx)
             candidates_img.append(frame)
             sharpness_list.append(_laplacian_sharpness(gray))
             exposure_list.append(_exposure_penalty(gray))
-        frame_pos += 1
-    cap.release()
 
     if not candidates_idx:
         return []
