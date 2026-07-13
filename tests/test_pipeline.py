@@ -1343,3 +1343,127 @@ print("OK", video_np.shape)
         video_np, fps = _read_video_pyav(corrupted_av1_video, width=224, height=224, max_frames=500)
         assert video_np.shape[0] > 0, "Phải đọc được ít nhất vài frame trước vùng hỏng"
 
+
+class TestVideoReaderRAMSafety:
+    """
+    Vá bug NGHIÊM TRỌNG phát hiện khi test trên video AIC thật
+    (K05_V030.mp4, 1920x1080, 32.714 frame): bản đầu của video_reader.py đọc
+    GIỮ NGUYÊN ĐỘ PHÂN GIẢI GỐC, với max_frames=6000 cần tới 37.3GB RAM,
+    khiến Kaggle kill process ("Killed", không traceback). Đã vá bằng resize
+    bắt buộc (mặc định 480x270) + giảm max_frames mặc định (2000).
+    """
+
+    def test_default_config_stays_under_2gb(self):
+        from aic_pipeline.video_reader import estimate_ram_gb, DEFAULT_MAX_FRAMES, DEFAULT_READ_WIDTH, DEFAULT_READ_HEIGHT
+        est = estimate_ram_gb(DEFAULT_MAX_FRAMES, DEFAULT_READ_WIDTH, DEFAULT_READ_HEIGHT)
+        assert est < 2.0, (
+            f"Cấu hình mặc định ước tính {est:.1f}GB RAM — vượt ngưỡng an toàn 2GB, "
+            f"nguy cơ lặp lại bug tràn RAM đã fix."
+        )
+
+    def test_full_res_1080p_config_would_exceed_kaggle_ram(self):
+        """Xác nhận ĐÚNG bug đã fix: cấu hình full-res 1920x1080 với
+        max_frames=6000 (cấu hình CŨ trước khi vá) THẬT SỰ vượt RAM Kaggle
+        (13-16GB) — nếu ai đó vô tình đổi resize_width/height=None mà không
+        giảm max_frames, phải cảnh báo được, không để lặp lại bug."""
+        from aic_pipeline.video_reader import estimate_ram_gb
+        est_old_buggy_config = estimate_ram_gb(6000, 1920, 1080)
+        assert est_old_buggy_config > 16.0, (
+            "Test này xác nhận đúng mức độ nghiêm trọng của bug cũ — nếu giá trị "
+            "này thay đổi, kiểm tra lại công thức estimate_ram_gb"
+        )
+
+    def test_get_video_frames_resizes_by_default(self, synthetic_video):
+        from aic_pipeline.video_reader import get_video_frames, clear_cache
+        clear_cache()
+        frames, fps = get_video_frames(synthetic_video)
+        assert frames.shape[1] == 270 and frames.shape[2] == 480, (
+            "Mặc định PHẢI resize xuống 480x270, không giữ nguyên gốc"
+        )
+
+    def test_get_video_frames_respects_custom_max_frames(self, synthetic_video):
+        from aic_pipeline.video_reader import get_video_frames, clear_cache
+        clear_cache()
+        frames, fps = get_video_frames(synthetic_video, max_frames=50)
+        assert frames.shape[0] <= 50
+
+    def test_cache_key_includes_config_avoids_stale_resolution(self, synthetic_video):
+        """Nếu gọi get_video_frames() với 2 cấu hình resize khác nhau cho
+        CÙNG 1 video, phải trả về đúng 2 kết quả khác nhau (không dùng nhầm
+        cache của cấu hình trước)."""
+        from aic_pipeline.video_reader import get_video_frames, clear_cache
+        clear_cache()
+        frames_a, _ = get_video_frames(synthetic_video, resize_width=480, resize_height=270)
+        frames_b, _ = get_video_frames(synthetic_video, resize_width=160, resize_height=90)
+        assert frames_a.shape[1:] != frames_b.shape[1:], (
+            "Cache key phải phân biệt theo resize config, tránh trả nhầm "
+            "kết quả của cấu hình khác."
+        )
+
+
+class TestVideoReaderCoversFullDuration:
+    """
+    Vá bug NGHIÊM TRỌNG #2 (phát hiện khi thảo luận về đánh đổi max_frames):
+    bản đầu dừng TUẦN TỰ ngay khi đủ max_frames — với video dài, chỉ đọc
+    được đoạn ĐẦU video rồi bỏ hẳn phần còn lại (không có shot/keyframe ở
+    đó). Đã vá bằng subsample cách đều để max_frames frame được chọn TRẢI
+    ĐỀU khắp toàn bộ video.
+    """
+
+    def test_frames_cover_full_video_duration_not_just_beginning(self, tmp_path):
+        """Test QUAN TRỌNG NHẤT: với video dài hơn max_frames cho phép,
+        thời lượng "phủ" (n_frames / fps_hieu_dung) phải xấp xỉ ĐÚNG thời
+        lượng video gốc, không chỉ đoạn đầu."""
+        import subprocess
+        import cv2
+        import numpy as np
+
+        # Tạo video dài hơn (60s) để có đủ khoảng cách kiểm tra rõ ràng
+        long_video = str(tmp_path / "long.mp4")
+        fps = 30
+        w, h = 320, 180
+        out = cv2.VideoWriter(long_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        n_total_frames = fps * 60  # 60 giây
+        for i in range(n_total_frames):
+            frame = np.full((h, w, 3), (i % 255, 50, 50), dtype=np.uint8)
+            out.write(frame)
+        out.release()
+
+        from aic_pipeline.video_reader import get_video_frames, clear_cache
+        clear_cache()
+
+        max_frames = 100  # ép subsample mạnh (60s*30fps=1800 frame gốc -> 100)
+        frames, fps_effective = get_video_frames(long_video, max_frames=max_frames)
+
+        duration_covered = frames.shape[0] / fps_effective
+        actual_duration = n_total_frames / fps
+
+        assert abs(duration_covered - actual_duration) < 2.0, (
+            f"Phải phủ gần đúng toàn bộ {actual_duration:.1f}s video gốc, "
+            f"nhưng chỉ phủ được {duration_covered:.1f}s — có dấu hiệu chỉ "
+            f"đọc đoạn đầu rồi dừng (bug đã fix)."
+        )
+
+    def test_frame_stride_calculated_correctly(self, tmp_path):
+        import cv2
+        import numpy as np
+
+        video_path = str(tmp_path / "test.mp4")
+        fps = 30
+        w, h = 160, 90
+        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        n_total = 600  # 20 giây
+        for i in range(n_total):
+            frame = np.full((h, w, 3), (i % 255, 0, 0), dtype=np.uint8)
+            out.write(frame)
+        out.release()
+
+        from aic_pipeline.video_reader import get_video_frames, clear_cache
+        clear_cache()
+
+        frames, fps_effective = get_video_frames(video_path, max_frames=60)
+        # 600 frame gốc / 60 max_frames = stride 10 -> fps hiệu dụng = 30/10 = 3.0
+        assert abs(fps_effective - 3.0) < 0.5, (
+            f"fps hiệu dụng phải xấp xỉ 3.0 (30/10), được {fps_effective}"
+        )
+
