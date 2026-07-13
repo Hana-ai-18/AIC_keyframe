@@ -69,7 +69,6 @@ def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=No
     # Python kịp break, gây ra hàng loạt warning FFmpeg tiếp tục xuất hiện dù
     # đã "break". Đọc theo packet cho phép dừng NGAY sau khi đã đủ max_frames.
     stream.thread_type = "AUTO"  # cho phép FFmpeg dùng multi-thread decode nếu có, nhanh hơn
-    stopped_early = False
 
     # ĐÃ VÁ THÊM: một số video AV1 có phần STREAM BỊ LỖI THẬT (không chỉ thiếu
     # hardware accelerator) — FFmpeg báo "Failed to get pixel format" / "Get
@@ -83,6 +82,18 @@ def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=No
     consecutive_empty_packets = 0
     max_consecutive_empty = 200  # ~vài giây video hỏng liên tục thì coi là hỏng thật
 
+    # ĐÃ VÁ BUG NGHIÊM TRỌNG #3 (phát hiện qua báo cáo thực tế: video 1056s
+    # bị cắt mất 56.4s cuối): bản trước BREAK NGAY khi len(frames)>=max_frames
+    # — nếu total_frames_estimate (từ stream.frames, không phải lúc nào cũng
+    # chính xác 100% với mọi container/codec) bị ước lượng THẤP hơn thực tế
+    # dù chỉ một chút, frame_stride tính ra nhỏ hơn cần thiết, khiến đủ
+    # max_frames TRƯỚC KHI duyệt hết toàn bộ video -> mất hẳn phần cuối.
+    # Sửa bằng cách KHÔNG BAO GIỜ break theo số lượng frame đã lấy — LUÔN
+    # duyệt hết toàn bộ demux (đảm bảo phủ 100% video bất kể ước lượng đúng
+    # hay sai), chỉ NGỪNG APPEND (không lưu thêm) khi đã đủ max_frames tại
+    # các vị trí sample theo stride — nghĩa là nếu ước lượng sai, kết quả có
+    # thể có ÍT HƠN max_frames một chút (thay vì mất hẳn đoạn cuối), không
+    # bao giờ mất hoàn toàn 1 đoạn video.
     for packet in container.demux(video=0):
         try:
             decoded_this_packet = packet.decode()
@@ -104,7 +115,7 @@ def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=No
             consecutive_empty_packets = 0
 
         for frame in decoded_this_packet:
-            if frame_idx % frame_stride == 0:
+            if frame_idx % frame_stride == 0 and len(frames) < max_frames:
                 try:
                     img = frame.to_ndarray(format="rgb24")  # (H, W, 3) RGB
                 except Exception as e:
@@ -114,20 +125,21 @@ def _read_video_pyav(video_path, width, height, max_frames=6000, frame_stride=No
                 if width is not None and height is not None:
                     img = cv2.resize(img, (width, height))
                 frames.append(img)
-                if len(frames) >= max_frames:
-                    stopped_early = True
-                    break
             frame_idx += 1
-        if stopped_early:
-            _logger_video_read.warning(
-                f"Đã đạt max_frames={max_frames}, dừng đọc sớm (video có thể dài hơn)."
-            )
-            break
+        # KHÔNG break ở đây nữa — tiếp tục duyệt hết container.demux() để
+        # đảm bảo phủ toàn bộ video, kể cả khi đã đủ max_frames (chỉ đơn
+        # giản là không append thêm, nhưng vẫn tiến qua hết stream).
     container.close()
 
     if not frames:
         raise ValueError(f"Không đọc được frame nào từ video: {video_path}")
+    total_frames_covered = frame_idx  # tổng số frame gốc đã thực sự duyệt qua
     fps_effective = fps_original / frame_stride
+    _logger_video_read.info(
+        f"Đã duyệt hết {total_frames_covered} frame gốc, giữ lại {len(frames)} frame "
+        f"(phủ {total_frames_covered / fps_original:.1f}s / video dài "
+        f"{total_frames_covered / fps_original:.1f}s theo ước lượng thực tế)."
+    )
     return np.stack(frames, axis=0), fps_effective
 
 

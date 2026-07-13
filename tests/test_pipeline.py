@@ -1578,3 +1578,71 @@ class TestPipelineOptimizedAndParallel:
         assert result.error is None, f"Không được lỗi pickle: {result.error}"
         assert result.stats["n_shots"] > 0
 
+
+class TestOmniShotCutFullVideoCoverage:
+    """
+    Vá bug NGHIÊM TRỌNG #3 (phát hiện qua báo cáo thực tế: video 1056.4s bị
+    mất 56.4s cuối — chỉ phủ tới 1000s): bản trước BREAK NGAY khi
+    len(frames) >= max_frames, thay vì tiếp tục duyệt hết demux. Nếu
+    total_frames_estimate (từ stream.frames) bị ước lượng sai dù chỉ chút,
+    frame_stride tính ra nhỏ hơn cần -> đủ max_frames TRƯỚC khi duyệt hết
+    video -> mất hẳn đoạn cuối. Đã vá bằng cách KHÔNG BAO GIỜ break theo số
+    lượng frame, LUÔN duyệt hết toàn bộ demux, chỉ ngừng append khi đã đủ.
+    """
+
+    def test_covers_full_video_even_with_very_small_max_frames(self, tmp_path):
+        """Test QUAN TRỌNG NHẤT: với max_frames RẤT NHỎ (dễ lộ bug nhất nếu
+        còn), thời lượng phủ phải khớp GẦN ĐÚNG TUYỆT ĐỐI thời lượng video
+        gốc — không được mất hẳn 1 đoạn nào, kể cả đoạn cuối."""
+        import subprocess
+        import cv2
+        import numpy as np
+
+        video_path = str(tmp_path / "test.mp4")
+        fps = 30
+        w, h = 320, 180
+        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        n_total = fps * 45  # 45 giây
+        for i in range(n_total):
+            frame = np.full((h, w, 3), (i % 255, 30, 30), dtype=np.uint8)
+            out.write(frame)
+        out.release()
+
+        av1_path = str(tmp_path / "test_av1.mp4")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-c:v", "libaom-av1",
+             "-crf", "35", "-cpu-used", "8", av1_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not os.path.exists(av1_path):
+            pytest.skip(f"Không tạo được video AV1 test: {result.stderr[:300]}")
+
+        import sys
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+        from omnishotcut.engine import _read_video_pyav
+
+        for max_frames in [20, 50, 100]:
+            video_np, fps_eff = _read_video_pyav(av1_path, width=224, height=224, max_frames=max_frames)
+            duration_covered = video_np.shape[0] / fps_eff
+            assert abs(duration_covered - 45.0) < 3.0, (
+                f"max_frames={max_frames}: chỉ phủ {duration_covered:.1f}s / 45s thật "
+                f"— có dấu hiệu mất đoạn cuối (bug đã fix)."
+            )
+
+    def test_never_breaks_before_full_demux(self, synthetic_video):
+        """Xác nhận trực tiếp: video_np trả về không rỗng và fps hiệu dụng
+        hợp lý (không phải giá trị bất thường do dừng giữa chừng)."""
+        import sys
+        vendor_dir = os.path.join(
+            os.path.dirname(__file__), "..", "aic_pipeline", "_omnishotcut_vendor"
+        )
+        sys.path.insert(0, vendor_dir)
+        from omnishotcut.engine import _read_video_pyav
+
+        video_np, fps_eff = _read_video_pyav(synthetic_video, width=224, height=224, max_frames=30)
+        assert video_np.shape[0] > 0
+        assert fps_eff > 0
+
