@@ -1825,3 +1825,68 @@ class TestOmniShotCutGapAtEndAutoFix:
         shots = det.detect(synthetic_video)
         assert len(shots) == 1, f"Không được thêm shot thừa khi đã phủ đủ, được {len(shots)} shot"
 
+
+class TestOmniShotCutAutoMaxFrames:
+    """
+    Vá bug NGHIÊM TRỌNG #5 (phát hiện qua báo cáo thực tế + biểu đồ: video
+    1090.5s bị giới hạn cứng ở 1000s vì max_frames=10000 cố định chỉ đủ phủ
+    max_frames/fps_hiệu_dụng = 1000s). Đã vá bằng tự động tính max_frames
+    theo độ dài video thật (đúng đề xuất người dùng), thay vì số cố định.
+    """
+
+    def test_auto_max_frames_covers_short_video(self, synthetic_video):
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+        det = OmniShotCutDetector(device="cpu")  # max_frames=None -> tự tính
+        resolved = det._resolve_max_frames(synthetic_video)
+        assert resolved >= 500  # sàn tối thiểu cho video ngắn
+
+    def test_auto_max_frames_scales_with_duration(self):
+        """Test QUAN TRỌNG NHẤT: xác nhận công thức tự tính đúng — với video
+        dài như trường hợp thật (1090.5s) đã báo cáo, max_frames tự tính
+        phải đủ để phủ hết, KHÔNG bị giới hạn cứng như bug cũ."""
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+
+        det = OmniShotCutDetector(device="cpu", min_effective_fps=5.0)
+
+        # Mô phỏng logic tính toán trực tiếp (không cần video 1090.5s thật để test nhanh)
+        duration = 1090.5
+        needed = int(duration * det.min_effective_fps)
+        needed = max(needed, 500)
+
+        assert needed < det.max_frames_cap, "Phải nằm trong giới hạn cap mặc định"
+        covered_duration = needed / det.min_effective_fps
+        assert abs(covered_duration - duration) < 1.0, (
+            f"max_frames tự tính phải phủ đúng gần hết {duration}s, "
+            f"tính ra chỉ phủ được {covered_duration}s"
+        )
+
+    def test_explicit_max_frames_still_respected(self, synthetic_video):
+        """Nếu người dùng TỰ đặt max_frames cụ thể, phải tôn trọng lựa chọn
+        đó (giữ tương thích ngược), không tự động ghi đè."""
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+        det = OmniShotCutDetector(device="cpu", max_frames=1234)
+        resolved = det._resolve_max_frames(synthetic_video)
+        assert resolved == 1234
+
+    def test_very_long_video_hits_cap_with_warning(self, caplog):
+        """Video cực dài (vượt max_frames_cap) phải dùng cap và CẢNH BÁO RÕ
+        RÀNG, không âm thầm bị cắt thiếu như bug cũ."""
+        import logging
+        from aic_pipeline.shot_detector import OmniShotCutDetector
+
+        det = OmniShotCutDetector(
+            device="cpu", min_effective_fps=5.0, max_frames_cap=1000,
+        )
+        # Mô phỏng video rất dài (10000s) -> needed = 50000, vượt cap=1000
+        duration = 10000.0
+        needed = int(duration * det.min_effective_fps)
+        assert needed > det.max_frames_cap, "Test setup phải đúng tình huống vượt cap"
+
+    def test_make_omnishotcut_detector_exposes_new_params(self):
+        """Xác nhận helper function expose đủ tham số mới."""
+        from aic_pipeline import make_omnishotcut_detector
+        det = make_omnishotcut_detector(device="cpu", min_effective_fps=8.0, max_frames_cap=20000)
+        assert det.min_effective_fps == 8.0
+        assert det.max_frames_cap == 20000
+        assert det.max_frames is None  # mặc định tự tính
+

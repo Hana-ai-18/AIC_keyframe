@@ -750,26 +750,88 @@ class OmniShotCutDetector:
         mode: str = "default",
         overlap_window_length: int = 20,
         min_shot_len: int = 5,
-        max_frames: int = 6000,
+        max_frames: Optional[int] = None,
+        min_effective_fps: float = 5.0,
+        max_frames_cap: int = 40000,
     ):
         """
-        max_frames: giới hạn RAM khi đọc video (xem docstring _read_video_pyav
-                    trong _omnishotcut_vendor/omnishotcut/engine.py). Video dài
-                    hơn max_frames sẽ TỰ ĐỘNG lấy mẫu cách đều để không tràn
-                    RAM — quan trọng với video dài (như dataset AIC, có video
-                    30.000+ frame) trên Kaggle (RAM giới hạn 13-16GB). Giảm
-                    số này nếu vẫn gặp lỗi "tried to allocate more memory";
-                    tăng lên (ví dụ 15000) nếu có nhiều RAM và muốn giữ độ
-                    chi tiết thời gian cao hơn cho video dài.
+        ĐÃ VÁ BUG NGHIÊM TRỌNG #5 (phát hiện qua báo cáo thực tế + biểu đồ
+        timeline: video 1090.5s nhưng plot chỉ hiện tới 1000s, video không
+        được cắt hết): max_frames CỐ ĐỊNH tạo ra TRẦN THỜI LƯỢNG TUYỆT ĐỐI
+        = max_frames / fps_hiệu_dụng — với max_frames=10000 và fps hiệu dụng
+        10.0 (do video quá dài phải subsample mạnh), trần chỉ đúng 1000s,
+        VĨNH VIỄN không thể phủ hết video dài hơn dù đã vá đúng cơ chế "duyệt
+        hết video" (bug #3) — vì bug #3 chỉ đảm bảo KHÔNG BỎ SÓT đoạn giữa,
+        không đảm bảo max_frames đủ lớn để phủ hết TOÀN BỘ thời lượng.
+
+        Đã sửa bằng CƠ CHẾ TỰ ĐỘNG SCALE THEO ĐỘ DÀI VIDEO THẬT (đúng đề
+        xuất của người dùng — "dựa vào độ dài của video" thay vì số cố định):
+
+        Args:
+            max_frames: nếu bạn TỰ đặt số cụ thể, dùng đúng số đó (giữ tương
+                        thích ngược) — NHƯNG khuyến nghị để None (mặc định)
+                        để tự động tính.
+            min_effective_fps: fps hiệu dụng TỐI THIỂU cần giữ được sau khi
+                        subsample — mặc định 5.0 (đủ để model bắt được hầu
+                        hết chuyển cảnh, video tin tức hiếm khi có shot ngắn
+                        hơn 0.2s). max_frames sẽ được TỰ TÍNH = độ_dài_video
+                        (giây) × min_effective_fps, đảm bảo LUÔN đủ để phủ
+                        hết video bất kể dài bao nhiêu.
+            max_frames_cap: trần TUYỆT ĐỐI để chặn RAM không tràn với video
+                        cực dài (ví dụ video hàng giờ) — nếu max_frames tự
+                        tính vượt số này, dùng max_frames_cap và CẢNH BÁO RÕ
+                        RÀNG rằng video này sẽ không phủ hết được ở
+                        min_effective_fps mong muốn (đây là đánh đổi RAM
+                        cứng, không thể né tránh với video cực dài).
         """
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.mode = mode
         self.overlap_window_length = overlap_window_length
         self.min_shot_len = min_shot_len
-        self.max_frames = max_frames
+        self.max_frames = max_frames  # None = tự tính theo video, số cụ thể = giữ tương thích ngược
+        self.min_effective_fps = min_effective_fps
+        self.max_frames_cap = max_frames_cap
         self._model = None
         self._model_args = None
+
+    def _resolve_max_frames(self, video_path: str) -> int:
+        """Tự tính max_frames cần thiết dựa trên độ dài video thật, đảm bảo
+        LUÔN phủ hết video ở fps hiệu dụng >= min_effective_fps (trừ khi
+        chạm max_frames_cap — video quá dài, phải đánh đổi RAM)."""
+        if self.max_frames is not None:
+            return self.max_frames  # người dùng tự đặt, tôn trọng lựa chọn đó
+
+        import av
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        fps_original = float(stream.average_rate) or 25.0
+        total_frames = stream.frames or 0
+        if total_frames == 0 and stream.duration and stream.time_base:
+            total_frames = int(float(stream.duration * stream.time_base) * fps_original)
+        duration_seconds = total_frames / fps_original if fps_original > 0 else 0
+        container.close()
+
+        needed_max_frames = int(duration_seconds * self.min_effective_fps)
+        needed_max_frames = max(needed_max_frames, 500)  # sàn tối thiểu cho video rất ngắn
+
+        if needed_max_frames > self.max_frames_cap:
+            logger.warning(
+                f"Video dài {duration_seconds:.0f}s cần max_frames={needed_max_frames} "
+                f"để đạt fps hiệu dụng {self.min_effective_fps}, nhưng vượt "
+                f"max_frames_cap={self.max_frames_cap} (giới hạn RAM). Dùng "
+                f"max_frames_cap — video này SẼ KHÔNG được phủ hết ở fps mong "
+                f"muốn, chỉ phủ ~{self.max_frames_cap / self.min_effective_fps:.0f}s "
+                f"đầu tương đương. Tăng max_frames_cap nếu có đủ RAM."
+            )
+            return self.max_frames_cap
+
+        logger.info(
+            f"Video dài {duration_seconds:.0f}s -> tự tính max_frames="
+            f"{needed_max_frames} để đảm bảo phủ hết ở fps hiệu dụng "
+            f"~{self.min_effective_fps}."
+        )
+        return needed_max_frames
 
     def _load_model(self):
         if self._model is not None:
@@ -846,9 +908,11 @@ class OmniShotCutDetector:
         from omnishotcut.engine import single_video_inference
         from omnishotcut.label_correspondence import unique_intra_label_mapping, intra_int2string
 
+        resolved_max_frames = self._resolve_max_frames(video_path)
+
         pred_ranges, pred_intra_labels, pred_inter_labels, _video_np, fps = single_video_inference(
             video_path, self._model, self._model_args, self.overlap_window_length,
-            max_frames=self.max_frames,
+            max_frames=resolved_max_frames,
         )
 
         if not pred_ranges:
@@ -951,7 +1015,9 @@ def make_omnishotcut_detector(
     mode: str = "default",
     overlap_window_length: int = 20,
     min_shot_len: int = 5,
-    max_frames: int = 6000,
+    max_frames: Optional[int] = None,
+    min_effective_fps: float = 5.0,
+    max_frames_cap: int = 40000,
 ) -> "OmniShotCutDetector":
     """
     Helper 1 dòng để THAY THẾ AutoShot bằng OmniShotCut làm shot detector.
@@ -980,14 +1046,32 @@ def make_omnishotcut_detector(
     (uva-cv-lab/OmniShotCut) ngay lần detect() đầu tiên — cần Internet: On
     trên Kaggle, không cần bạn tự tải/upload checkpoint thủ công.
 
-    max_frames: QUAN TRỌNG với video dài (dataset AIC có video 30.000+
-                frame) — giới hạn số frame giữ trong RAM khi đọc video,
-                tránh lỗi Kaggle tự restart kernel vì "tried to allocate
-                more memory than is available". Giảm xuống (ví dụ 3000)
-                nếu vẫn gặp lỗi tràn RAM trên video rất dài/độ phân giải cao.
+    ĐÃ VÁ BUG NGHIÊM TRỌNG #5 — max_frames giờ TỰ ĐỘNG TÍNH THEO ĐỘ DÀI VIDEO
+    THẬT (đúng đề xuất người dùng: "sao không để tuỳ vào độ dài của video"),
+    thay vì số cố định. max_frames=6000 CỐ ĐỊNH từng gây ra bug thật: video
+    1090.5s bị giới hạn cứng ở 1000s (10000 frame / 10.0 fps hiệu dụng =
+    1000s TRẦN TUYỆT ĐỐI) — không liên quan gì đến bug model đã vá trước đó,
+    mà là hệ quả toán học của việc dùng số max_frames cố định không đủ lớn
+    cho video dài.
+
+    Args:
+        max_frames: để None (MẶC ĐỊNH, khuyến nghị) để TỰ ĐỘNG tính theo độ
+                    dài video — luôn đảm bảo phủ hết. Chỉ tự đặt số cụ thể
+                    nếu bạn có lý do riêng (ví dụ muốn ép cùng 1 cấu hình
+                    cho toàn bộ dataset).
+        min_effective_fps: fps hiệu dụng TỐI THIỂU muốn giữ sau subsample —
+                    mặc định 5.0. max_frames được tự tính = độ_dài_video ×
+                    min_effective_fps.
+        max_frames_cap: trần cứng chặn RAM tràn với video CỰC dài (mặc định
+                    40000 ~ 6GB RAM ở độ phân giải 224x224, an toàn cho
+                    Kaggle 13-16GB). Với min_effective_fps=5.0 mặc định, cap
+                    này cho phép phủ hết video tới ~2.2 giờ — đủ dư cho hầu
+                    hết video tin tức. Tăng nếu cần xử lý video dài hơn và
+                    có đủ RAM.
     """
     return OmniShotCutDetector(
         checkpoint_path=checkpoint_path, device=device, mode=mode,
         overlap_window_length=overlap_window_length, min_shot_len=min_shot_len,
-        max_frames=max_frames,
+        max_frames=max_frames, min_effective_fps=min_effective_fps,
+        max_frames_cap=max_frames_cap,
     )
