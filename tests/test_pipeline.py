@@ -2048,3 +2048,187 @@ class TestHFTeamPipeline:
         assert "K01_broken" not in results
         assert pushed == ["K01_good"]
 
+
+class TestHFTeamPipelineZipBackup:
+    """
+    Vá vấn đề thực tế: push HuggingFace bị lỗi 403 Forbidden (token sai
+    quyền gated repo) khiến TOÀN BỘ 31 video xử lý xong nhưng KHÔNG được
+    lưu ở đâu cả (bug cũ: chỉ push, không có nơi lưu dự phòng). Đã thêm cơ
+    chế ZIP DỰ PHÒNG — mỗi video LUÔN được ghi vào zip TRƯỚC khi thử push
+    HF, nên dù push lỗi hoàn toàn, không mất dữ liệu.
+    """
+
+    def test_zip_backup_survives_hf_push_failure(self, tmp_path, monkeypatch, synthetic_video):
+        """Test QUAN TRỌNG NHẤT: mô phỏng ĐÚNG lỗi 403 Forbidden thật đã gặp
+        — push luôn luôn raise Exception — xác nhận zip vẫn có đủ dữ liệu."""
+        import shutil
+        import zipfile
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        def fake_push_403(target_repo, video_out_dir, video_id, hf_token):
+            raise Exception(
+                "403 Forbidden: Please enable access to public gated "
+                "repositories in your fine-grained token settings"
+            )
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: False)
+        monkeypatch.setattr(mod, "_push_result_to_hf", fake_push_403)
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        zip_path = str(tmp_path / "backup.zip")
+        results = mod.stream_process_and_publish(
+            source_repo="enduong/AIC-video2025",
+            target_repo="hananguyen18/AIC_PixelPals",
+            video_files=["K01_V001.mp4"],
+            pipeline_config_factory=make_config,
+            hf_token="fake_token",
+            tmp_download_dir=str(tmp_path / "dl"), tmp_output_dir=str(tmp_path / "out"),
+            zip_backup_path=zip_path,
+        )
+
+        assert "K01_V001" in results, (
+            "Video phải được coi là xử lý THÀNH CÔNG dù push HF lỗi hoàn "
+            "toàn — mục tiêu cốt lõi là không mất dữ liệu."
+        )
+        assert os.path.exists(zip_path), "File zip PHẢI tồn tại dù push HF lỗi"
+
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+            assert any("K01_V001/metadata.json" in n for n in names)
+            assert any(n.endswith(".jpg") for n in names)
+
+    def test_republish_zip_pushes_saved_data_without_reprocessing(self, tmp_path, monkeypatch, synthetic_video):
+        """Sau khi khắc phục lỗi token, republish_zip_to_hf phải đẩy lại
+        được dữ liệu đã có trong zip lên HF, KHÔNG cần tải/xử lý lại video."""
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: False)
+        monkeypatch.setattr(mod, "_push_result_to_hf", lambda *a, **k: (_ for _ in ()).throw(Exception("403")))
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        zip_path = str(tmp_path / "backup.zip")
+        mod.stream_process_and_publish(
+            source_repo="enduong/AIC-video2025", target_repo="hananguyen18/AIC_PixelPals",
+            video_files=["K01_V001.mp4"], pipeline_config_factory=make_config,
+            hf_token="fake_token", tmp_download_dir=str(tmp_path / "dl"),
+            tmp_output_dir=str(tmp_path / "out"), zip_backup_path=zip_path,
+        )
+
+        # Bây giờ mô phỏng "đã sửa token" — push thành công
+        pushed = []
+
+        def fake_push_now_works(target_repo, video_out_dir, video_id, hf_token):
+            assert "metadata.json" in os.listdir(video_out_dir)
+            pushed.append(video_id)
+
+        monkeypatch.setattr(mod, "_push_result_to_hf", fake_push_now_works)
+
+        results = mod.republish_zip_to_hf(
+            zip_backup_path=zip_path, target_repo="hananguyen18/AIC_PixelPals",
+            hf_token="fixed_token",
+        )
+        assert results == {"K01_V001": True}
+        assert pushed == ["K01_V001"]
+
+    def test_push_to_hf_false_only_writes_zip(self, tmp_path, monkeypatch, synthetic_video):
+        """push_to_hf=False phải KHÔNG BAO GIỜ gọi push, chỉ ghi zip."""
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        push_called = []
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_push_result_to_hf", lambda *a, **k: push_called.append(1))
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        zip_path = str(tmp_path / "backup.zip")
+        results = mod.stream_process_and_publish(
+            source_repo="enduong/AIC-video2025", target_repo=None,
+            video_files=["K01_V001.mp4"], pipeline_config_factory=make_config,
+            hf_token="fake_token", tmp_download_dir=str(tmp_path / "dl"),
+            tmp_output_dir=str(tmp_path / "out"), zip_backup_path=zip_path,
+            push_to_hf=False,
+        )
+        assert len(push_called) == 0
+        assert "K01_V001" in results
+        assert os.path.exists(zip_path)
+
+    def test_skip_existing_checks_zip_without_network(self, tmp_path, monkeypatch, synthetic_video):
+        """skip_existing phải kiểm tra được zip cục bộ mà KHÔNG cần gọi mạng
+        (quan trọng khi HF đang có vấn đề, vẫn tránh xử lý trùng)."""
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        download_calls = []
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            download_calls.append(filename)
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        zip_path = str(tmp_path / "backup.zip")
+
+        mod.stream_process_and_publish(
+            source_repo="enduong/AIC-video2025", target_repo=None,
+            video_files=["K01_V001.mp4"], pipeline_config_factory=make_config,
+            hf_token="fake_token", tmp_download_dir=str(tmp_path / "dl1"),
+            tmp_output_dir=str(tmp_path / "out1"), zip_backup_path=zip_path,
+            push_to_hf=False,
+        )
+        assert len(download_calls) == 1
+
+        # Chạy lại lần 2 - phải skip vì đã có trong zip
+        mod.stream_process_and_publish(
+            source_repo="enduong/AIC-video2025", target_repo=None,
+            video_files=["K01_V001.mp4"], pipeline_config_factory=make_config,
+            hf_token="fake_token", tmp_download_dir=str(tmp_path / "dl2"),
+            tmp_output_dir=str(tmp_path / "out2"), zip_backup_path=zip_path,
+            push_to_hf=False, skip_existing=True,
+        )
+        assert len(download_calls) == 1, "Lần 2 phải skip, không tải lại"
+

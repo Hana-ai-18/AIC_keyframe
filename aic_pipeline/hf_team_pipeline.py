@@ -236,9 +236,34 @@ def _push_result_to_hf(
     )
 
 
+def _append_result_to_zip(zip_path: str, video_out_dir: str, video_id: str):
+    """
+    ĐÃ THÊM — CƠ CHẾ DỰ PHÒNG ZIP: ghi kết quả của 1 video vào file zip cục
+    bộ, ĐỘC LẬP HOÀN TOÀN với việc push HuggingFace có thành công hay không.
+
+    Vì sao cần: nếu HuggingFace bị lỗi (token sai quyền, gated repo, rate
+    limit, mất mạng giữa chừng...) — như đã gặp thật (403 Forbidden) — kết
+    quả đã xử lý xong KHÔNG ĐƯỢC MẤT. File zip là nguồn sự thật thứ 2, luôn
+    được ghi trước khi thử push lên HF, để dù HF lỗi bao nhiêu lần, bạn vẫn
+    có đủ kết quả để tải về hoặc tự push lại sau.
+
+    Dùng chế độ APPEND ("a") — mỗi video được thêm vào ngay khi xử lý xong,
+    không cần đợi tới cuối mới nén 1 lần (nếu Kaggle session hết giờ giữa
+    chừng, zip vẫn có đủ các video đã xử lý TRƯỚC thời điểm đó).
+    """
+    import zipfile
+
+    with zipfile.ZipFile(zip_path, "a", zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(video_out_dir):
+            for fname in files:
+                full_path = os.path.join(root, fname)
+                arcname = os.path.join(video_id, fname)
+                zf.write(full_path, arcname)
+
+
 def stream_process_and_publish(
     source_repo: str,
-    target_repo: str,
+    target_repo: Optional[str],
     video_files: List[str],
     pipeline_config_factory: Callable,
     hf_token: Optional[str] = None,
@@ -246,55 +271,90 @@ def stream_process_and_publish(
     tmp_download_dir: str = "/kaggle/working/_tmp_video_download",
     tmp_output_dir: str = "/kaggle/working/_tmp_processed",
     use_optimized: bool = True,
+    zip_backup_path: Optional[str] = "/kaggle/working/keyframes_backup.zip",
+    push_to_hf: bool = True,
 ) -> Dict[str, dict]:
     """
     Entry point chính: với TỪNG video trong video_files — tải về, chạy
-    pipeline, lưu kết quả gọn, PUSH lên target_repo, xoá sạch local (cả
-    video gốc lẫn kết quả gọn đã push), chuyển video tiếp theo.
+    pipeline, lưu kết quả gọn, GHI VÀO ZIP DỰ PHÒNG (luôn luôn), rồi CỐ GẮNG
+    push lên target_repo (nếu push_to_hf=True — lỗi push KHÔNG làm mất kết
+    quả vì đã có trong zip), xoá sạch local tạm, chuyển video tiếp theo.
 
-    Đĩa không bao giờ giữ quá 1 video gốc + 1 kết quả gọn cùng lúc — an toàn
-    với dataset lớn (162GB+) trên Kaggle (RAM/disk giới hạn).
+    Đĩa không bao giờ giữ quá 1 video gốc + 1 kết quả gọn tạm cùng lúc (ngoại
+    trừ file zip dự phòng tích luỹ dần — đây là kết quả CẦN GIỮ LẠI, không
+    phải rác tạm).
+
+    ĐÃ THÊM CƠ CHẾ DỰ PHÒNG ZIP (theo yêu cầu: "tránh trường hợp huggingface
+    bị lỗi"): mỗi video xử lý xong LUÔN được ghi vào zip_backup_path TRƯỚC,
+    sau đó mới thử push lên HuggingFace. Nếu push lỗi (như 403 Forbidden đã
+    gặp thật, hoặc mất mạng, rate limit...), kết quả VẪN AN TOÀN trong zip —
+    không phải chạy lại từ đầu. Đặt push_to_hf=False để CHỈ lưu zip, không
+    thử push HF (hữu ích nếu biết trước token có vấn đề, xử lý xong rồi push
+    thủ công sau).
 
     Args:
         source_repo: dataset nguồn video, ví dụ "enduong/AIC-video2025".
         target_repo: dataset ĐÍCH lưu kết quả, ví dụ "hananguyen18/AIC_PixelPals".
-                     Cần quyền Write (collaborator) trên dataset này.
+                     Có thể để None nếu push_to_hf=False (chỉ dùng zip).
         video_files: danh sách file cần xử lý — lấy từ
                      list_videos_by_prefix_range().
-        pipeline_config_factory: hàm KHÔNG THAM SỐ trả về PipelineConfig mới
-                     (đúng factory pattern đã dùng cho run_pipeline_batch_parallel
-                     — model được tạo mới mỗi lần gọi, không truyền model đã
-                     load sẵn qua tiến trình khác).
-        hf_token: token HF — cần quyền Read trên source_repo VÀ quyền Write
-                     trên target_repo.
-        skip_existing: True (mặc định) — bỏ qua video đã có kết quả trên
-                     target_repo rồi, cho phép chạy lại giữa chừng (session
-                     Kaggle hết giờ) hoặc NHIỀU NGƯỜI cùng chạy 1 khoảng
-                     video mà không đụng nhau (kiểm tra qua HF API mỗi video,
-                     nên vẫn có khả năng nhỏ 2 người cùng lúc xử lý trùng 1
-                     video nếu bấm chạy gần như đồng thời — chấp nhận được
-                     vì chỉ tốn công trùng, không gây lỗi dữ liệu).
+        pipeline_config_factory: hàm KHÔNG THAM SỐ trả về PipelineConfig mới.
+        hf_token: token HF — cần quyền Read trên source_repo, và Write trên
+                     target_repo nếu push_to_hf=True.
+        skip_existing: True (mặc định) — bỏ qua video ĐÃ CÓ TRONG ZIP DỰ
+                     PHÒNG (kiểm tra local, không cần mạng) HOẶC đã có trên
+                     target_repo (nếu push_to_hf=True) — cho phép chạy lại
+                     giữa chừng mà không xử lý trùng.
+        zip_backup_path: đường dẫn file zip dự phòng — None để TẮT hẳn cơ
+                     chế zip (không khuyến nghị, chỉ dùng nếu chắc chắn HF
+                     luôn hoạt động ổn định).
+        push_to_hf: True (mặc định) — cố gắng push lên target_repo sau khi
+                     đã ghi zip. False — CHỈ ghi zip, không đụng gì tới HF
+                     (dùng khi biết trước có vấn đề với HF, xử lý toàn bộ
+                     bằng zip rồi push thủ công sau khi khắc phục).
 
     Returns:
-        Dict {video_id: metadata_dict} cho các video xử lý THÀNH CÔNG trong
-        lần chạy này (không tính video đã skip).
+        Dict {video_id: metadata_dict} cho các video xử lý THÀNH CÔNG (đã
+        ghi vào zip) trong lần chạy này — bao gồm cả video mà bước PUSH HF
+        bị lỗi (miễn zip ghi thành công), vì mục tiêu cốt lõi là "xử lý xong,
+        không mất dữ liệu", còn push HF là bước cộng thêm.
     """
     _check_hf_hub_available()
 
+    if push_to_hf and not target_repo:
+        raise ValueError("push_to_hf=True yêu cầu phải có target_repo.")
+
     os.makedirs(tmp_download_dir, exist_ok=True)
     os.makedirs(tmp_output_dir, exist_ok=True)
+    if zip_backup_path:
+        os.makedirs(os.path.dirname(zip_backup_path) or ".", exist_ok=True)
+
+    def _already_in_zip(video_id: str) -> bool:
+        if not zip_backup_path or not os.path.exists(zip_backup_path):
+            return False
+        import zipfile
+        try:
+            with zipfile.ZipFile(zip_backup_path, "r") as zf:
+                return any(name.startswith(f"{video_id}/metadata.json") for name in zf.namelist())
+        except zipfile.BadZipFile:
+            return False
 
     results: Dict[str, dict] = {}
-    n_ok, n_err, n_skip = 0, 0, 0
+    n_ok, n_err, n_skip, n_push_failed = 0, 0, 0, 0
     t_start = time.time()
 
     for i, filename in enumerate(video_files):
         video_id = os.path.splitext(os.path.basename(filename))[0]
 
-        if skip_existing and _remote_result_exists(target_repo, video_id, hf_token):
-            logger.info(f"[{i+1}/{len(video_files)}] Bỏ qua (đã có trên {target_repo}): {video_id}")
-            n_skip += 1
-            continue
+        if skip_existing:
+            if _already_in_zip(video_id):
+                logger.info(f"[{i+1}/{len(video_files)}] Bỏ qua (đã có trong zip dự phòng): {video_id}")
+                n_skip += 1
+                continue
+            if push_to_hf and _remote_result_exists(target_repo, video_id, hf_token):
+                logger.info(f"[{i+1}/{len(video_files)}] Bỏ qua (đã có trên {target_repo}): {video_id}")
+                n_skip += 1
+                continue
 
         logger.info(f"[{i+1}/{len(video_files)}] Tải: {filename}")
         t0 = time.time()
@@ -319,19 +379,38 @@ def stream_process_and_publish(
 
             meta = _save_result_compact(result, tmp_output_dir, video_id)
 
-            t2 = time.time()
-            _push_result_to_hf(target_repo, video_out_dir, video_id, hf_token)
-            t_push = time.time() - t2
+            # GHI VÀO ZIP DỰ PHÒNG TRƯỚC — đây là bước ĐẢM BẢO KHÔNG MẤT DỮ
+            # LIỆU, làm TRƯỚC khi thử push HF (có thể lỗi).
+            t_zip = 0.0
+            if zip_backup_path:
+                t2 = time.time()
+                _append_result_to_zip(zip_backup_path, video_out_dir, video_id)
+                t_zip = time.time() - t2
 
             results[video_id] = meta
             n_ok += 1
+
+            # CỐ GẮNG PUSH LÊN HF — lỗi ở đây KHÔNG làm video này bị coi là
+            # thất bại (đã có trong zip rồi), chỉ log cảnh báo riêng.
+            t_push = 0.0
+            if push_to_hf:
+                try:
+                    t3 = time.time()
+                    _push_result_to_hf(target_repo, video_out_dir, video_id, hf_token)
+                    t_push = time.time() - t3
+                except Exception as e:
+                    n_push_failed += 1
+                    logger.warning(
+                        f"  Push lên HuggingFace THẤT BẠI cho {video_id} (dữ liệu vẫn AN "
+                        f"TOÀN trong {zip_backup_path}): {type(e).__name__}: {e}"
+                    )
 
             elapsed = time.time() - t_start
             avg = elapsed / (n_ok + n_skip if (n_ok + n_skip) else 1)
             remaining = avg * (len(video_files) - i - 1)
             logger.info(
                 f"  -> {result.stats['n_shots']} shot, {result.stats['n_keyframes']} keyframe | "
-                f"xử lý {t_process:.1f}s, push {t_push:.1f}s | "
+                f"xử lý {t_process:.1f}s, zip {t_zip:.1f}s, push {t_push:.1f}s | "
                 f"ước tính còn {remaining/3600:.1f}h cho {len(video_files)-i-1} video"
             )
 
@@ -341,8 +420,6 @@ def stream_process_and_publish(
             n_err += 1
 
         finally:
-            # LUÔN dọn sạch local (dù thành công hay lỗi) — đảm bảo đĩa
-            # không bao giờ tích luỹ, đúng nguyên tắc streaming.
             if local_video_path is not None and os.path.exists(local_video_path):
                 os.remove(local_video_path)
             if os.path.exists(video_out_dir):
@@ -356,7 +433,73 @@ def stream_process_and_publish(
 
     total_elapsed = time.time() - t_start
     logger.info(
-        f"HOÀN TẤT: {n_ok} thành công, {n_err} lỗi, {n_skip} bỏ qua (đã xử lý trước) "
+        f"HOÀN TẤT: {n_ok} thành công (đã lưu zip), {n_push_failed} lỗi push HF "
+        f"(vẫn an toàn trong zip), {n_err} lỗi xử lý, {n_skip} bỏ qua "
         f"/ tổng {len(video_files)} video. Thời gian: {total_elapsed/3600:.2f}h."
     )
+    if zip_backup_path and os.path.exists(zip_backup_path):
+        logger.info(
+            f"File zip dự phòng: {zip_backup_path} "
+            f"({os.path.getsize(zip_backup_path)/1e6:.1f} MB)"
+        )
+    return results
+
+
+def republish_zip_to_hf(
+    zip_backup_path: str,
+    target_repo: str,
+    hf_token: Optional[str] = None,
+    skip_existing: bool = True,
+) -> Dict[str, bool]:
+    """
+    HÀM DỰ PHÒNG BỔ SUNG: push lại TOÀN BỘ nội dung file zip dự phòng lên
+    HuggingFace — dùng khi lần chạy trước push HF bị lỗi (ví dụ 403 do
+    token sai quyền), sau khi đã khắc phục vấn đề token, chạy hàm này để
+    đẩy nốt kết quả đã có sẵn trong zip lên mà KHÔNG cần tải/xử lý lại video
+    từ đầu.
+
+    Args:
+        zip_backup_path: đường dẫn file zip đã tạo bởi stream_process_and_publish.
+        target_repo: dataset đích, ví dụ "hananguyen18/AIC_PixelPals".
+        hf_token: token HF có quyền Write trên target_repo.
+        skip_existing: bỏ qua video ĐÃ CÓ trên target_repo rồi (kiểm tra qua
+                     API), tránh push trùng nếu 1 phần zip đã được push
+                     thành công từ trước.
+
+    Returns:
+        Dict {video_id: True/False} — True nếu push thành công, False nếu lỗi.
+    """
+    _check_hf_hub_available()
+    import zipfile
+    import tempfile
+
+    results: Dict[str, bool] = {}
+
+    with zipfile.ZipFile(zip_backup_path, "r") as zf:
+        all_names = zf.namelist()
+        video_ids = sorted(set(name.split("/")[0] for name in all_names if "/" in name))
+        logger.info(f"File zip có kết quả của {len(video_ids)} video: {video_ids}")
+
+        for i, video_id in enumerate(video_ids):
+            if skip_existing and _remote_result_exists(target_repo, video_id, hf_token):
+                logger.info(f"[{i+1}/{len(video_ids)}] Bỏ qua (đã có trên {target_repo}): {video_id}")
+                continue
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                video_out_dir = os.path.join(tmp_dir, video_id)
+                os.makedirs(video_out_dir, exist_ok=True)
+                member_names = [n for n in all_names if n.startswith(f"{video_id}/")]
+                for name in member_names:
+                    zf.extract(name, tmp_dir)
+
+                try:
+                    _push_result_to_hf(target_repo, video_out_dir, video_id, hf_token)
+                    results[video_id] = True
+                    logger.info(f"[{i+1}/{len(video_ids)}] Push THÀNH CÔNG: {video_id}")
+                except Exception as e:
+                    results[video_id] = False
+                    logger.error(f"[{i+1}/{len(video_ids)}] Push LỖI: {video_id}: {e}")
+
+    n_ok = sum(results.values())
+    logger.info(f"Hoàn tất republish: {n_ok}/{len(results)} video push thành công.")
     return results
