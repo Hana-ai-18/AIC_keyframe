@@ -1890,3 +1890,161 @@ class TestOmniShotCutAutoMaxFrames:
         assert det.max_frames_cap == 20000
         assert det.max_frames is None  # mặc định tự tính
 
+
+class TestHFTeamPipeline:
+    """
+    Module chia việc cắt keyframe theo nhóm prefix (K01-K05...) cho nhiều
+    người làm song song, tự động push kết quả lên HuggingFace Dataset chung.
+    Test bằng mock — không cần token/mạng thật.
+    """
+
+    def test_parse_prefix_extracts_correctly(self):
+        from aic_pipeline.hf_team_pipeline import parse_prefix
+        assert parse_prefix("K01_V001.mp4") == "K01"
+        assert parse_prefix("K23_V007.mp4") == "K23"
+        assert parse_prefix("k05_v030.mp4") == "K05"
+        assert parse_prefix(".gitattributes") is None
+        assert parse_prefix("README.md") is None
+        assert parse_prefix("K1_V001.mp4") is None
+
+    def test_list_videos_by_prefix_range_filters_correctly(self, monkeypatch):
+        fake_files = [
+            ".gitattributes", "README.md",
+            "K01_V001.mp4", "K01_V002.mp4",
+            "K02_V001.mp4",
+            "K05_V001.mp4", "K05_V030.mp4",
+            "K06_V001.mp4",
+            "K10_V001.mp4",
+        ]
+
+        class FakeApi:
+            def __init__(self, token=None):
+                pass
+            def list_repo_files(self, repo_id, repo_type):
+                return fake_files
+
+        import aic_pipeline.hf_team_pipeline as mod
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+        monkeypatch.setattr("huggingface_hub.HfApi", FakeApi)
+
+        result = mod.list_videos_by_prefix_range("fake/repo", "K01", "K05", hf_token="x")
+        assert len(result) == 5  # K01x2 + K02x1 + K05x2
+        assert "K06_V001.mp4" not in result
+        assert "K10_V001.mp4" not in result
+        assert result == sorted(result)
+
+    def test_list_videos_raises_on_invalid_range(self, monkeypatch):
+        import aic_pipeline.hf_team_pipeline as mod
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+        with pytest.raises(ValueError):
+            mod.list_videos_by_prefix_range("fake/repo", "K05", "K01", hf_token="x")
+
+    def test_stream_process_and_publish_full_flow(self, tmp_path, monkeypatch, synthetic_video):
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        pushed = []
+
+        def fake_push(target_repo, video_out_dir, video_id, hf_token):
+            files = os.listdir(video_out_dir)
+            assert "metadata.json" in files
+            pushed.append(video_id)
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: False)
+        monkeypatch.setattr(mod, "_push_result_to_hf", fake_push)
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        tmp_dl = str(tmp_path / "dl")
+        tmp_out = str(tmp_path / "out")
+
+        results = mod.stream_process_and_publish(
+            source_repo="fake/source", target_repo="fake/target",
+            video_files=["K01_V001.mp4"],
+            pipeline_config_factory=make_config,
+            hf_token="fake_token",
+            tmp_download_dir=tmp_dl, tmp_output_dir=tmp_out,
+        )
+
+        assert "K01_V001" in results
+        assert pushed == ["K01_V001"]
+        assert not os.path.exists(os.path.join(tmp_dl, "K01_V001.mp4")), "Video gốc phải bị xoá"
+        assert not os.path.exists(os.path.join(tmp_out, "K01_V001")), "Kết quả local phải bị xoá sau khi push"
+
+    def test_skip_existing_avoids_redownload(self, tmp_path, monkeypatch):
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        call_log = []
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            call_log.append(filename)
+            raise Exception("Không được gọi khi đã skip")
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: True)
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap")
+
+        results = mod.stream_process_and_publish(
+            source_repo="fake/source", target_repo="fake/target",
+            video_files=["K01_V001.mp4", "K01_V002.mp4"],
+            pipeline_config_factory=make_config,
+            hf_token="fake_token", skip_existing=True,
+            tmp_download_dir=str(tmp_path / "dl"), tmp_output_dir=str(tmp_path / "out"),
+        )
+
+        assert len(call_log) == 0
+        assert len(results) == 0
+
+    def test_broken_video_does_not_stop_batch(self, tmp_path, monkeypatch, synthetic_video):
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            if "broken" in filename:
+                with open(dest, "wb") as f:
+                    f.write(b"not a real video")
+            else:
+                shutil.copy(synthetic_video, dest)
+            return dest
+
+        pushed = []
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: False)
+        monkeypatch.setattr(mod, "_push_result_to_hf", lambda tr, d, vid, tok: pushed.append(vid))
+
+        def make_config():
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        results = mod.stream_process_and_publish(
+            source_repo="fake/source", target_repo="fake/target",
+            video_files=["K01_broken.mp4", "K01_good.mp4"],
+            pipeline_config_factory=make_config,
+            hf_token="fake_token",
+            tmp_download_dir=str(tmp_path / "dl"), tmp_output_dir=str(tmp_path / "out"),
+        )
+
+        assert "K01_good" in results
+        assert "K01_broken" not in results
+        assert pushed == ["K01_good"]
+
