@@ -1975,6 +1975,7 @@ class TestHFTeamPipeline:
             pipeline_config_factory=make_config,
             hf_token="fake_token",
             tmp_download_dir=tmp_dl, tmp_output_dir=tmp_out,
+            zip_backup_path=str(tmp_path / "backup.zip"),  # cô lập, tránh nhiễu file mặc định
         )
 
         assert "K01_V001" in results
@@ -2006,6 +2007,7 @@ class TestHFTeamPipeline:
             pipeline_config_factory=make_config,
             hf_token="fake_token", skip_existing=True,
             tmp_download_dir=str(tmp_path / "dl"), tmp_output_dir=str(tmp_path / "out"),
+            zip_backup_path=str(tmp_path / "backup.zip"),  # cô lập, tránh nhiễu file mặc định
         )
 
         assert len(call_log) == 0
@@ -2042,6 +2044,7 @@ class TestHFTeamPipeline:
             pipeline_config_factory=make_config,
             hf_token="fake_token",
             tmp_download_dir=str(tmp_path / "dl"), tmp_output_dir=str(tmp_path / "out"),
+            zip_backup_path=str(tmp_path / "backup.zip"),  # cô lập, tránh nhiễu file mặc định
         )
 
         assert "K01_good" in results
@@ -2231,4 +2234,104 @@ class TestHFTeamPipelineZipBackup:
             push_to_hf=False, skip_existing=True,
         )
         assert len(download_calls) == 1, "Lần 2 phải skip, không tải lại"
+
+
+class TestHFTeamPipelineFactoryCalledOnce:
+    """
+    Vá bug NGHIÊM TRỌNG (phát hiện qua báo cáo thực tế: 12 giờ không xử lý
+    xong 1 video, trong khi bản đọc video local từ Kaggle Dataset chạy nhanh
+    bình thường): pipeline_config_factory() (tải checkpoint OmniShotCut từ
+    HuggingFace + load SigLIP2 lên GPU) trước đây bị gọi LẠI TỪ ĐẦU cho MỖI
+    VIDEO bên trong vòng lặp — với N video, tốn N lần tải checkpoint + load
+    GPU thay vì chỉ 1 lần. Đã vá: factory chỉ gọi ĐÚNG 1 LẦN trước vòng lặp.
+    """
+
+    def test_factory_called_exactly_once_for_multiple_videos(self, tmp_path, monkeypatch, synthetic_video):
+        """Test QUAN TRỌNG NHẤT: với N video, factory (mô phỏng load model
+        tốn kém) chỉ được gọi ĐÚNG 1 LẦN, không phải N lần."""
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: False)
+
+        call_count = {"n": 0}
+
+        def make_config_counting():
+            call_count["n"] += 1
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        results = mod.stream_process_and_publish(
+            source_repo="fake/source", target_repo=None,
+            video_files=["K01_V001.mp4", "K01_V002.mp4", "K01_V003.mp4"],
+            pipeline_config_factory=make_config_counting,
+            hf_token="fake_token",
+            tmp_download_dir=str(tmp_path / "dl"), tmp_output_dir=str(tmp_path / "out"),
+            zip_backup_path=str(tmp_path / "backup.zip"),
+            push_to_hf=False,
+        )
+
+        assert call_count["n"] == 1, (
+            f"Factory bị gọi {call_count['n']} lần thay vì đúng 1 lần cho "
+            f"3 video — đây chính là bug gây 12 giờ không xử lý xong 1 video "
+            f"(tải checkpoint + load model GPU lặp lại mỗi video)."
+        )
+        assert len(results) == 3
+
+    def test_factory_still_called_once_with_skipped_videos(self, tmp_path, monkeypatch, synthetic_video):
+        """Ngay cả khi 1 số video bị skip (đã có trong zip), factory vẫn chỉ
+        gọi 1 lần — không phụ thuộc số video thực sự được xử lý."""
+        import shutil
+        import aic_pipeline.hf_team_pipeline as mod
+        from aic_pipeline import PipelineConfig
+
+        monkeypatch.setattr(mod, "_check_hf_hub_available", lambda: None)
+
+        def fake_download(source_repo, filename, local_dir, hf_token):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            shutil.copy(synthetic_video, dest)
+            return dest
+
+        monkeypatch.setattr(mod, "_download_one_video", fake_download)
+        monkeypatch.setattr(mod, "_remote_result_exists", lambda *a, **k: False)
+
+        call_count = {"n": 0}
+
+        def make_config_counting():
+            call_count["n"] += 1
+            return PipelineConfig(feature_mode="cheap", store_images=True)
+
+        zip_path = str(tmp_path / "backup.zip")
+        common_kwargs = dict(
+            source_repo="fake/source", target_repo=None,
+            pipeline_config_factory=make_config_counting, hf_token="fake_token",
+            zip_backup_path=zip_path, push_to_hf=False,
+        )
+
+        mod.stream_process_and_publish(
+            video_files=["K01_V001.mp4"],
+            tmp_download_dir=str(tmp_path / "dl1"), tmp_output_dir=str(tmp_path / "out1"),
+            **common_kwargs,
+        )
+        assert call_count["n"] == 1
+
+        # Lần 2: video này đã có trong zip -> sẽ bị skip hết, nhưng factory
+        # vẫn phải được gọi đúng 1 lần nữa (không phải 0 lần) vì hàm luôn
+        # khởi tạo model trước khi biết video nào sẽ bị skip.
+        mod.stream_process_and_publish(
+            video_files=["K01_V001.mp4", "K01_V002.mp4"],
+            tmp_download_dir=str(tmp_path / "dl2"), tmp_output_dir=str(tmp_path / "out2"),
+            **common_kwargs,
+        )
+        assert call_count["n"] == 2, "Lần gọi thứ 2 (session mới) phải khởi tạo factory đúng 1 lần"
 

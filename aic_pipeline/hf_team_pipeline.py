@@ -343,6 +343,23 @@ def stream_process_and_publish(
     n_ok, n_err, n_skip, n_push_failed = 0, 0, 0, 0
     t_start = time.time()
 
+    # ĐÃ VÁ BUG NGHIÊM TRỌNG (phát hiện qua báo cáo thực tế: 12 giờ không xử
+    # lý xong 1 video, trong khi bản dùng Kaggle Dataset local chạy nhanh
+    # bình thường): pipeline_config_factory() (tải checkpoint OmniShotCut từ
+    # HuggingFace + load SigLIP2 lên GPU) trước đây bị gọi LẠI TỪ ĐẦU cho
+    # MỖI VIDEO bên trong vòng lặp — với hàng chục/hàng trăm video, đây là
+    # hàng chục/hàng trăm lần tải checkpoint qua mạng + load lại GPU, tốn
+    # thời gian gấp nhiều lần xử lý thật. Đã sửa: gọi ĐÚNG 1 LẦN DUY NHẤT
+    # TRƯỚC vòng lặp — model được tái sử dụng cho toàn bộ video trong lần
+    # chạy này (đây chính xác là cách stream_process_and_publish() chạy
+    # TUẦN TỰ nên dùng — khác với run_pipeline_batch_parallel(), nơi factory
+    # phải gọi lại trong MỖI WORKER PROCESS vì multiprocessing không chia sẻ
+    # được model/CUDA context giữa các process).
+    logger.info("Đang khởi tạo model (OmniShotCut + embedder) — chỉ 1 lần cho toàn bộ batch...")
+    t_init = time.time()
+    config = pipeline_config_factory()
+    logger.info(f"Khởi tạo model xong sau {time.time()-t_init:.1f}s — sẽ dùng lại cho tất cả video.")
+
     for i, filename in enumerate(video_files):
         video_id = os.path.splitext(os.path.basename(filename))[0]
 
@@ -369,7 +386,6 @@ def stream_process_and_publish(
                 f"-> chạy pipeline..."
             )
 
-            config = pipeline_config_factory()
             from .pipeline import run_pipeline, run_pipeline_optimized
             fn = run_pipeline_optimized if use_optimized else run_pipeline
 
