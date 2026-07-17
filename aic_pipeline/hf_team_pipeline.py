@@ -474,31 +474,66 @@ def republish_zip_to_hf(
     đẩy nốt kết quả đã có sẵn trong zip lên mà KHÔNG cần tải/xử lý lại video
     từ đầu.
 
+    ĐÃ VÁ: skip_existing=True (mặc định) TỰ ĐỘNG bỏ qua video ĐÃ CÓ trên
+    target_repo rồi — an toàn để CHẠY LẠI NHIỀU LẦN (ví dụ nếu 1 vài video
+    push lỗi giữa chừng do mất mạng, chạy lại cell này sẽ chỉ đẩy tiếp đúng
+    phần còn thiếu, không push trùng, không tốn thời gian xử lý lại).
+
+    ĐÃ TỐI ƯU: danh sách file đã có trên target_repo được lấy ĐÚNG 1 LẦN qua
+    API (không phải gọi lại cho từng video trong zip) — với zip có hàng chục
+    video, tránh hàng chục lần gọi API không cần thiết.
+
     Args:
         zip_backup_path: đường dẫn file zip đã tạo bởi stream_process_and_publish.
         target_repo: dataset đích, ví dụ "hananguyen18/AIC_PixelPals".
         hf_token: token HF có quyền Write trên target_repo.
         skip_existing: bỏ qua video ĐÃ CÓ trên target_repo rồi (kiểm tra qua
-                     API), tránh push trùng nếu 1 phần zip đã được push
-                     thành công từ trước.
+                     API, 1 lần duy nhất), tránh push trùng nếu 1 phần zip
+                     đã được push thành công từ trước.
 
     Returns:
-        Dict {video_id: True/False} — True nếu push thành công, False nếu lỗi.
+        Dict {video_id: True/False} — True nếu push thành công, False nếu
+        lỗi. Video bị SKIP (đã có sẵn) KHÔNG xuất hiện trong dict trả về —
+        chỉ những video thực sự được xử lý (push thành công hoặc thất bại)
+        trong lần gọi này mới có mặt.
     """
     _check_hf_hub_available()
     import zipfile
     import tempfile
+    from huggingface_hub import HfApi
 
     results: Dict[str, bool] = {}
+
+    # Lấy danh sách file remote ĐÚNG 1 LẦN — tránh gọi API lặp lại cho từng
+    # video (trước đây _remote_result_exists() tự gọi API riêng mỗi lần,
+    # tốn N lần request cho N video trong zip).
+    already_on_remote: set = set()
+    if skip_existing:
+        try:
+            api = HfApi(token=hf_token)
+            remote_files = api.list_repo_files(repo_id=target_repo, repo_type="dataset")
+            already_on_remote = {
+                name.split("/")[0] for name in remote_files
+                if "/" in name and name.endswith("metadata.json")
+            }
+            logger.info(f"Đã có {len(already_on_remote)} video trên {target_repo} từ trước.")
+        except Exception as e:
+            logger.warning(
+                f"Không lấy được danh sách file trên {target_repo} để kiểm tra "
+                f"trùng ({e}) — sẽ thử push TẤT CẢ, có thể ghi đè video đã có "
+                f"(không gây lỗi, chỉ tốn thời gian push lại)."
+            )
 
     with zipfile.ZipFile(zip_backup_path, "r") as zf:
         all_names = zf.namelist()
         video_ids = sorted(set(name.split("/")[0] for name in all_names if "/" in name))
         logger.info(f"File zip có kết quả của {len(video_ids)} video: {video_ids}")
 
+        n_skip = 0
         for i, video_id in enumerate(video_ids):
-            if skip_existing and _remote_result_exists(target_repo, video_id, hf_token):
+            if skip_existing and video_id in already_on_remote:
                 logger.info(f"[{i+1}/{len(video_ids)}] Bỏ qua (đã có trên {target_repo}): {video_id}")
+                n_skip += 1
                 continue
 
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -517,5 +552,8 @@ def republish_zip_to_hf(
                     logger.error(f"[{i+1}/{len(video_ids)}] Push LỖI: {video_id}: {e}")
 
     n_ok = sum(results.values())
-    logger.info(f"Hoàn tất republish: {n_ok}/{len(results)} video push thành công.")
+    logger.info(
+        f"Hoàn tất republish: {n_ok}/{len(results)} video push thành công, "
+        f"{n_skip} video đã có sẵn từ trước (bỏ qua)."
+    )
     return results
