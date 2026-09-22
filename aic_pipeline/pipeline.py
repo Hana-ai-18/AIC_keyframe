@@ -53,6 +53,25 @@ class PipelineConfig:
     store_images: bool = True
     store_embeddings: bool = False
 
+    # ĐÃ VÁ BUG NGHIÊM TRỌNG #6 (phát hiện qua báo cáo thực tế: video 5 phút
+    # bị mất >1 phút cuối, dù Tầng 1 shot detection đã phủ đủ) — NGUYÊN NHÂN:
+    # select_keyframes() (Tầng 4) trước đây luôn đọc video với max_frames MẶC
+    # ĐỊNH CỐ ĐỊNH (DEFAULT_MAX_FRAMES=2000 trong video_reader.py), hoàn toàn
+    # ĐỘC LẬP và KHÔNG đồng bộ với max_frames mà Tầng 1 (OmniShotCutDetector)
+    # tự tính theo min_effective_fps. Với video dài, phép chia lấy nguyên
+    # (frame_stride = total_frames // max_frames) luôn làm rơi phần dư ở
+    # CUỐI video — video càng ngắn thì tỷ lệ % thời lượng bị mất càng lớn.
+    #
+    # Vá bằng cách TỰ CÂN ĐỐI max_frames của Tầng 4 THEO ĐÚNG CÔNG THỨC Tầng 1
+    # đang dùng (xem video_reader.resolve_max_frames — dùng CHUNG 1 hàm cho
+    # cả 2 tầng, tránh lệch pha): max_frames = độ_dài_video(s) ×
+    # frame_min_effective_fps, chặn trần bởi frame_max_frames_cap để không
+    # tràn RAM với video cực dài. Tính 1 LẦN cho cả video (không phải mỗi
+    # shot), dùng chung cho toàn bộ vòng lặp select_keyframes().
+    frame_min_effective_fps: float = 5.0   # đồng bộ mặc định với Tầng 1 (min_effective_fps)
+    frame_max_frames_cap: int = 40000      # đồng bộ mặc định với Tầng 1 (max_frames_cap) — trần RAM
+    frame_read_max_frames: Optional[int] = None  # tự đặt số cụ thể nếu muốn ghi đè tự tính, giữ tương thích ngược
+
 
 @dataclasses.dataclass
 class PipelineResult:
@@ -80,6 +99,17 @@ def run_pipeline(video_path: str, config: Optional[PipelineConfig] = None) -> Pi
 
     shots = detect_shots(video_path, backend=config.shot_backend, **config.shot_kwargs)
     t1 = time.time()
+
+    # Tự cân đối max_frames cho Tầng 4 — xem giải thích đầy đủ ở comment Bug #6
+    # trong PipelineConfig phía trên. Tính 1 LẦN, dùng chung cho mọi shot.
+    from .video_reader import resolve_max_frames
+    resolved_frame_max = config.frame_read_max_frames
+    if resolved_frame_max is None:
+        resolved_frame_max = resolve_max_frames(
+            video_path,
+            min_effective_fps=config.frame_min_effective_fps,
+            max_frames_cap=config.frame_max_frames_cap,
+        )
 
     motion_profiles = score_motion(
         video_path, shots,
@@ -117,6 +147,7 @@ def run_pipeline(video_path: str, config: Optional[PipelineConfig] = None) -> Pi
             frame_stride=config.frame_stride,
             store_images=config.store_images,
             store_embeddings=config.store_embeddings,
+            max_frames=resolved_frame_max,
         )
         keyframes.extend(kfs)
     t4 = time.time()
@@ -169,7 +200,10 @@ def run_pipeline_optimized(video_path: str, config: Optional[PipelineConfig] = N
     cần format/resize riêng cho model DETR) — đây là giới hạn hợp lý vì
     Tầng 1 cần độ phân giải/fps khác hẳn Tầng 2/4.
     """
-    from .video_reader import get_video_frames, DEFAULT_MAX_FRAMES, DEFAULT_READ_WIDTH, DEFAULT_READ_HEIGHT
+    from .video_reader import (
+        get_video_frames, resolve_max_frames,
+        DEFAULT_READ_WIDTH, DEFAULT_READ_HEIGHT,
+    )
 
     config = config or PipelineConfig()
     t0 = time.time()
@@ -177,11 +211,25 @@ def run_pipeline_optimized(video_path: str, config: Optional[PipelineConfig] = N
     shots = detect_shots(video_path, backend=config.shot_backend, **config.shot_kwargs)
     t1 = time.time()
 
+    # Tự cân đối max_frames cho Tầng 4 — xem giải thích Bug #6 trong
+    # PipelineConfig. QUAN TRỌNG: phải dùng ĐÚNG max_frames này cho CẢ dòng
+    # preload dưới đây LẪN select_keyframes() ở vòng lặp bên dưới — vì
+    # video_reader.py cache theo (video_path, max_frames, resize), lệch
+    # max_frames giữa 2 chỗ = cache miss = mất hết lợi ích "đọc 1 lần" của
+    # hàm optimized này (âm thầm đọc lại video lần 2, không báo lỗi).
+    resolved_frame_max = config.frame_read_max_frames
+    if resolved_frame_max is None:
+        resolved_frame_max = resolve_max_frames(
+            video_path,
+            min_effective_fps=config.frame_min_effective_fps,
+            max_frames_cap=config.frame_max_frames_cap,
+        )
+
     # Đọc video ĐÚNG 1 LẦN ở đây — score_motion() và select_keyframes() bên
     # dưới sẽ tự động dùng lại cache này (cùng video_path + cùng cấu hình
-    # resize mặc định) qua video_reader.py, không đọc lại từ đầu.
+    # resize + max_frames) qua video_reader.py, không đọc lại từ đầu.
     get_video_frames(
-        video_path, max_frames=DEFAULT_MAX_FRAMES,
+        video_path, max_frames=resolved_frame_max,
         resize_width=DEFAULT_READ_WIDTH, resize_height=DEFAULT_READ_HEIGHT,
     )
     t_preload = time.time()
@@ -222,6 +270,7 @@ def run_pipeline_optimized(video_path: str, config: Optional[PipelineConfig] = N
             frame_stride=config.frame_stride,
             store_images=config.store_images,
             store_embeddings=config.store_embeddings,
+            max_frames=resolved_frame_max,
         )
         keyframes.extend(kfs)
     t4 = time.time()

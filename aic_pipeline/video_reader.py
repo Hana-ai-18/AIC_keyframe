@@ -39,7 +39,7 @@ _CACHE_MAX_VIDEOS = 1  # chỉ giữ 1 video gần nhất trong RAM
 # đánh giá "frame nào nét/mờ" chính xác, không cần 1920x1080 gốc.
 DEFAULT_READ_WIDTH = 480
 DEFAULT_READ_HEIGHT = 270
-DEFAULT_MAX_FRAMES = 2000
+DEFAULT_MAX_FRAMES = 40000
 
 
 def estimate_ram_gb(n_frames: int, width: int, height: int) -> float:
@@ -180,6 +180,43 @@ def get_video_frames(
 
     _cache[cache_key] = (frames, fps)
     return frames, fps
+
+
+def resolve_max_frames(
+    video_path: str,
+    min_effective_fps: float = 5.0,
+    max_frames_cap: int = 40000,
+    floor_frames: int = 500,
+) -> int:
+    """
+    Tự cân đối max_frames: đủ để phủ HẾT thời lượng video thật ở fps hiệu
+    dụng >= min_effective_fps, nhưng KHÔNG vượt max_frames_cap (trần RAM).
+    Dùng CHUNG cho mọi tầng đọc video (Tầng 1 - shot detection, Tầng 4 -
+    frame selection) để đảm bảo đồng bộ, không tầng nào bị lệch độ phân
+    giải thời gian so với tầng khác.
+    """
+    import av
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    fps_original = float(stream.average_rate) or 25.0
+    total_frames = stream.frames or 0
+    if total_frames == 0 and stream.duration and stream.time_base:
+        total_frames = int(float(stream.duration * stream.time_base) * fps_original)
+    duration_seconds = total_frames / fps_original if fps_original > 0 else 0
+    container.close()
+
+    needed = max(int(duration_seconds * min_effective_fps), floor_frames)
+
+    if needed > max_frames_cap:
+        logger.warning(
+            f"Video dài {duration_seconds:.0f}s cần max_frames={needed} để đạt "
+            f"fps hiệu dụng {min_effective_fps}, nhưng vượt max_frames_cap="
+            f"{max_frames_cap} (giới hạn RAM) -> dùng max_frames_cap, video này "
+            f"sẽ không phủ hết ở fps mong muốn."
+        )
+        return max_frames_cap
+
+    return needed
 
 
 def get_frame_range(

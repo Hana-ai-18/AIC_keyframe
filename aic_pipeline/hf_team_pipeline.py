@@ -72,7 +72,8 @@ logger = logging.getLogger("aic_pipeline.hf_team_pipeline")
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
 
 # Khớp đúng pattern K{2 chữ số}_V{3 chữ số} — ví dụ K01_V001.mp4, K23_V007.mp4
-_PREFIX_PATTERN = re.compile(r"^(K\d{2})_V(\d{3})", re.IGNORECASE)
+# Khớp pattern {1 chữ cái}{2 chữ số}_V{3 chữ số} — ví dụ K01_V001.mp4, L21_V001.mp4
+_PREFIX_PATTERN = re.compile(r"^([A-Z]\d{3})-V(\d{3})", re.IGNORECASE)
 
 
 def _check_hf_hub_available():
@@ -92,6 +93,23 @@ def parse_prefix(filename: str) -> Optional[str]:
     m = _PREFIX_PATTERN.match(basename)
     return m.group(1).upper() if m else None
 
+def _parse_video_code(filename: str) -> Optional[str]:
+    """Trích mã đầy đủ 'L26_V001' từ tên file (thay vì chỉ 'L26')."""
+    basename = os.path.basename(filename)
+    m = _PREFIX_PATTERN.match(basename)
+    return f"{m.group(1).upper()}-V{m.group(2)}" if m else None
+
+
+def _normalize_range_bound(code: str, is_end: bool) -> str:
+    """
+    Cho phép truyền cả 2 kiểu:
+      - "L26"          -> tự mở rộng thành cả nhóm (V000..V999)
+      - "L26_V001"     -> mốc chính xác tới từng video
+    """
+    code = code.upper().strip()
+    if "-V" not in code:
+        code = code + ("-V999" if is_end else "-V000")
+    return code
 
 def list_videos_by_prefix_range(
     source_repo: str,
@@ -99,36 +117,15 @@ def list_videos_by_prefix_range(
     prefix_end: str,
     hf_token: Optional[str] = None,
 ) -> List[str]:
-    """
-    Liệt kê danh sách video trong khoảng prefix [prefix_start, prefix_end]
-    (bao gồm cả 2 đầu), KHÔNG TẢI GÌ — chỉ list metadata qua HF API, rất
-    nhanh dù dataset có hàng trăm/nghìn file.
-
-    Args:
-        source_repo: dataset nguồn, ví dụ "enduong/AIC-video2025".
-        prefix_start, prefix_end: khoảng nhóm K được giao, ví dụ "K01", "K05"
-                                   -> lấy tất cả video từ K01 đến K05
-                                   (K01, K02, K03, K04, K05), không phân biệt
-                                   hoa/thường, "k01" cũng hợp lệ.
-        hf_token: token HF (bắt buộc vì dataset nguồn gated).
-
-    Returns:
-        List đường dẫn file trong repo nguồn (chưa tải), đã SẮP XẾP theo tên
-        (K01_V001, K01_V002, ..., K05_V0XX) để xử lý theo thứ tự dễ theo dõi.
-
-    Raises:
-        ValueError nếu prefix_start > prefix_end (khoảng rỗng) — báo lỗi rõ
-        ràng ngay từ đầu, tránh chạy xong mới phát hiện không có video nào.
-    """
     _check_hf_hub_available()
     from huggingface_hub import HfApi
 
-    prefix_start = prefix_start.upper()
-    prefix_end = prefix_end.upper()
+    prefix_start = _normalize_range_bound(prefix_start, is_end=False)
+    prefix_end = _normalize_range_bound(prefix_end, is_end=True)
     if prefix_start > prefix_end:
         raise ValueError(
             f"prefix_start ({prefix_start}) phải <= prefix_end ({prefix_end}). "
-            f"Ví dụ đúng: prefix_start='K01', prefix_end='K05'."
+            f"Ví dụ đúng: 'K01','K05' (cả nhóm) hoặc 'L26_V001','L26_V100' (chia nhỏ trong nhóm)."
         )
 
     api = HfApi(token=hf_token)
@@ -138,11 +135,11 @@ def list_videos_by_prefix_range(
     for f in all_files:
         if not f.lower().endswith(VIDEO_EXTENSIONS):
             continue
-        prefix = parse_prefix(f)
-        if prefix is None:
+        code = _parse_video_code(f)
+        if code is None:
             logger.debug(f"Bỏ qua file không khớp pattern K{{XX}}_V{{XXX}}: {f}")
             continue
-        if prefix_start <= prefix <= prefix_end:
+        if prefix_start <= code <= prefix_end:
             selected.append(f)
 
     selected.sort()
@@ -198,12 +195,14 @@ def _save_result_compact(result, output_dir: str, video_id: str) -> Dict:
             "feature_mode": kf.feature_mode,
         }
         if kf.image is not None:
-            img_name = f"kf_{i:04d}_shot{kf.shot_id}_t{kf.timestamp:.2f}.jpg"
+            ts_ms = int(round(kf.timestamp * 1000))
+            img_name = f"{video_id}_{ts_ms:08d}.jpg"
             cv2.imwrite(
                 os.path.join(video_out_dir, img_name), kf.image,
                 [cv2.IMWRITE_JPEG_QUALITY, 90],
             )
             entry["image_file"] = img_name
+
         keyframe_meta.append(entry)
 
     meta = {

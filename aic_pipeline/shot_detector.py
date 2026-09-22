@@ -1075,3 +1075,9 @@ def make_omnishotcut_detector(
         max_frames=max_frames, min_effective_fps=min_effective_fps,
         max_frames_cap=max_frames_cap,
     )
+
+def _resolve_max_frames(self, video_path: str) -> int:
+    if self.max_frames is not None:
+        return self.max_frames
+    from .video_reader import resolve_max_frames
+    return resolve_max_frames(video_path, self.min_effective_fps, self.max_frames_cap)

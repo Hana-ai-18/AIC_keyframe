@@ -120,6 +120,7 @@ def select_keyframes(
     frame_stride: int = 1,
     store_images: bool = True,
     store_embeddings: bool = False,
+    max_frames: Optional[int] = None,
 ) -> List[Keyframe]:
     """
     Entry point Tầng 4.
@@ -150,10 +151,11 @@ def select_keyframes(
     # DÙNG start_time/end_time (giây, LUÔN ĐÚNG) thay vì start_frame/end_frame
     # (có thể sai hệ quy chiếu nếu detector — như OmniShotCutDetector — tính
     # frame theo fps đã subsample khác fps gốc của video_reader).
-    from .video_reader import get_frame_range_by_time, get_video_frames
+    from .video_reader import get_frame_range_by_time, get_video_frames, DEFAULT_MAX_FRAMES
 
-    frame_indices_range, frames_bgr = get_frame_range_by_time(video_path, shot.start_time, shot.end_time)
-    _all_frames, fps = get_video_frames(video_path)
+    _max_frames = max_frames or DEFAULT_MAX_FRAMES
+    frame_indices_range, frames_bgr = get_frame_range_by_time(video_path, shot.start_time, shot.end_time, max_frames=_max_frames)
+    _all_frames, fps = get_video_frames(video_path, max_frames=_max_frames)
 
     candidates_idx: List[int] = []
     candidates_img: List[np.ndarray] = []
